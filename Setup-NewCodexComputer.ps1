@@ -9,7 +9,7 @@ $ErrorActionPreference = "Stop"
 $script:TranscriptStarted = $false
 $script:LogPath = $null
 $script:AtcDiagPath = $null
-$script:SetupVersion = "1.0.51"
+$script:SetupVersion = "2.0"
 $script:ChatImportHelperSha256 = "9099F2671970CA0ACF29AF6DE0964F287767420C880FA8D84B7F4DA6FA5388C5"
 
 function Initialize-AtcDiagnosticLog {
@@ -131,6 +131,178 @@ function Ask-YesNo([string]$Question, [bool]$DefaultYes = $true) {
     return $result
 }
 
+
+
+function Get-HostVsCodeExtensionMatches([string]$ExtensionId) {
+    $matches = @()
+    $roots = @(
+        (Join-Path $env:USERPROFILE ".vscode\extensions"),
+        (Join-Path $env:USERPROFILE ".vscode-insiders\extensions")
+    )
+
+    foreach ($root in $roots) {
+        if (-not (Test-Path -LiteralPath $root -PathType Container)) { continue }
+        try {
+            $matches += @(
+                Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue |
+                    Where-Object { $_.Name -like ($ExtensionId + "-*") -or $_.Name -eq $ExtensionId } |
+                    ForEach-Object { $_.FullName }
+            )
+        }
+        catch {}
+    }
+
+    return @($matches | Select-Object -Unique)
+}
+
+function Get-AssistantConfigState([string]$ConfigPath) {
+    $state = [ordered]@{
+        Codex = $false
+        Claude = $false
+        CodexSignals = @()
+        ClaudeSignals = @()
+    }
+
+    if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) {
+        return [pscustomobject]$state
+    }
+
+    try {
+        $raw = Get-Content -LiteralPath $ConfigPath -Raw -ErrorAction Stop
+        $cfg = $raw | ConvertFrom-Json -ErrorAction Stop
+
+        $extensions = @()
+        if (
+            $cfg.PSObject.Properties['customizations'] -and $cfg.customizations -and
+            $cfg.customizations.PSObject.Properties['vscode'] -and $cfg.customizations.vscode -and
+            $cfg.customizations.vscode.PSObject.Properties['extensions']
+        ) {
+            $extensions = @($cfg.customizations.vscode.extensions | ForEach-Object { ([string]$_).ToLowerInvariant() })
+        }
+
+        if ($extensions -contains 'openai.chatgpt') {
+            $state.Codex = $true
+            $state.CodexSignals += 'devcontainer.json deklariert openai.chatgpt'
+        }
+        if ($extensions -contains 'anthropic.claude-code') {
+            $state.Claude = $true
+            $state.ClaudeSignals += 'devcontainer.json deklariert anthropic.claude-code'
+        }
+
+        foreach ($mount in @($cfg.mounts)) {
+            $target = Get-DevContainerMountValue $mount 'target'
+            if ($target -eq '/home/vscode/.codex') {
+                $state.Codex = $true
+                $state.CodexSignals += 'devcontainer.json enthält ein persistentes .codex-Volume'
+            }
+            if ($target -eq '/home/vscode/.claude') {
+                $state.Claude = $true
+                $state.ClaudeSignals += 'devcontainer.json enthält ein persistentes .claude-Volume'
+            }
+        }
+
+        if (
+            $cfg.PSObject.Properties['containerEnv'] -and $cfg.containerEnv -and
+            $cfg.containerEnv.PSObject.Properties['CLAUDE_CONFIG_DIR']
+        ) {
+            $state.Claude = $true
+            $state.ClaudeSignals += 'devcontainer.json setzt CLAUDE_CONFIG_DIR'
+        }
+    }
+    catch {
+        Write-Verbose "KI-Assistenten konnten aus '$ConfigPath' nicht vollständig erkannt werden: $($_.Exception.Message)"
+    }
+
+    return [pscustomobject]$state
+}
+
+function Test-LocalClaudeCodeUsage([string]$ClaudeHome, [string]$ClaudeGlobalState) {
+    if (Test-Path -LiteralPath $ClaudeGlobalState -PathType Leaf) { return $true }
+    if (-not (Test-Path -LiteralPath $ClaudeHome -PathType Container)) { return $false }
+
+    foreach ($name in @('history.jsonl','settings.json','.credentials.json','CLAUDE.md','projects','plugins','agents','skills')) {
+        if (Test-Path -LiteralPath (Join-Path $ClaudeHome $name)) { return $true }
+    }
+
+    try {
+        return (@(Get-ChildItem -LiteralPath $ClaudeHome -Force -ErrorAction SilentlyContinue).Count -gt 0)
+    }
+    catch {
+        return $false
+    }
+}
+
+function Get-WslAssistantUsageState([string]$Distro) {
+    $result = [ordered]@{
+        CodexSignals = @()
+        ClaudeSignals = @()
+    }
+
+    if ([string]::IsNullOrWhiteSpace($Distro) -or (Test-SystemWslDistro $Distro)) {
+        return [pscustomobject]$result
+    }
+
+    $wslExe = "$env:WINDIR\System32\wsl.exe"
+    if (-not (Test-Path -LiteralPath $wslExe -PathType Leaf)) {
+        return [pscustomobject]$result
+    }
+
+    $probeScript = 'if command -v codex >/dev/null 2>&1; then echo "CODEX_CLI=$(command -v codex)"; fi; if [ -d "$HOME/.codex" ]; then echo CODEX_HOME; fi; if command -v claude >/dev/null 2>&1; then echo "CLAUDE_CLI=$(command -v claude)"; fi; if [ -d "$HOME/.claude" ] || [ -f "$HOME/.claude.json" ]; then echo CLAUDE_HOME; fi'
+    $probe = Invoke-Probe $wslExe @('-d', $Distro, '--', 'sh', '-lc', $probeScript)
+    if ($probe.ExitCode -ne 0) {
+        return [pscustomobject]$result
+    }
+
+    foreach ($line in @($probe.StdOut -split "`r?`n")) {
+        $value = ([string]$line).Trim()
+        if ($value -like 'CODEX_CLI=*') { $result.CodexSignals += "Codex-CLI in WSL '$Distro': $($value.Substring(10))" }
+        elseif ($value -eq 'CODEX_HOME') { $result.CodexSignals += "Codex-Benutzerzustand in WSL '$Distro'" }
+        elseif ($value -like 'CLAUDE_CLI=*') { $result.ClaudeSignals += "Claude-Code-CLI in WSL '$Distro': $($value.Substring(11))" }
+        elseif ($value -eq 'CLAUDE_HOME') { $result.ClaudeSignals += "Claude-Code-Benutzerzustand in WSL '$Distro'" }
+    }
+
+    return [pscustomobject]$result
+}
+
+function Select-AiAssistants([object]$Preflight) {
+    $useCodex = [bool]$Preflight.CodexDetected
+    $useClaude = [bool]$Preflight.ClaudeDetected
+
+    Step "KI-Assistenten auswählen"
+
+    if ($useCodex -and $useClaude) {
+        Write-Host "Codex und Claude Code wurden bereits erkannt; beide werden ohne Rückfrage beibehalten." -ForegroundColor Green
+    }
+    elseif ($useCodex) {
+        Write-Host "Codex wurde bereits erkannt." -ForegroundColor Green
+        $useClaude = Ask-YesNo "Claude Code zusätzlich installieren und einrichten?" $false
+    }
+    elseif ($useClaude) {
+        Write-Host "Claude Code wurde bereits erkannt." -ForegroundColor Green
+        $useCodex = Ask-YesNo "OpenAI/Codex zusätzlich installieren und einrichten?" $false
+    }
+    else {
+        Write-Host "Es wurde weder Codex noch Claude Code erkannt."
+        Write-Host ""
+        while ($true) {
+            $answer = (Read-Host "KI-Assistent auswählen: [1] OpenAI/Codex  [2] Claude Code  [3] beide").Trim()
+            if ($answer -eq '1') { $useCodex = $true; $useClaude = $false; break }
+            if ($answer -eq '2') { $useCodex = $false; $useClaude = $true; break }
+            if ($answer -eq '3') { $useCodex = $true; $useClaude = $true; break }
+            Write-Host "Bitte 1, 2 oder 3 eingeben." -ForegroundColor Yellow
+        }
+    }
+
+    Write-Host ""
+    Write-Host "Gewählte KI-Assistenten:" -ForegroundColor Cyan
+    Write-Host ("  OpenAI/Codex: " + $(if ($useCodex) { 'Ja' } else { 'Nein' }))
+    Write-Host ("  Claude Code:  " + $(if ($useClaude) { 'Ja' } else { 'Nein' }))
+
+    return [pscustomobject]@{
+        Codex = $useCodex
+        Claude = $useClaude
+    }
+}
 
 function Test-DotNet11GaAvailable {
     $url = "https://dotnetcli.blob.core.windows.net/dotnet/release-metadata/11.0/releases.json"
@@ -279,8 +451,9 @@ RUN set -eux; \
       ln -sf /usr/local/share/dotnet/dotnet /usr/local/bin/dotnet; \
       rm -f /tmp/dotnet-install.sh; \
     fi; \
-    mkdir -p /home/vscode/.vscode-server/extensions; \
-    chown -R vscode:vscode /home/vscode/.vscode-server; \
+    mkdir -p /home/vscode/.vscode-server/extensions /home/vscode/.codex /home/vscode/.claude; \
+    chown -R vscode:vscode /home/vscode/.vscode-server /home/vscode/.codex /home/vscode/.claude; \
+    chmod 700 /home/vscode/.codex /home/vscode/.claude; \
     rm -rf /var/lib/apt/lists/*
 '@
 }
@@ -1316,6 +1489,7 @@ function Write-DevContainerDiagnostics([object[]]$Containers) {
             if (
                 $m.Destination -eq "/workspaces" -or
                 $m.Destination -eq "/home/vscode/.codex" -or
+                $m.Destination -eq "/home/vscode/.claude" -or
                 $m.Destination -eq "/home/vscode/.vscode-server/extensions" -or
                 $m.Name -like "*codex*" -or
                 $m.Source -like "*codex*"
@@ -1334,22 +1508,19 @@ function Find-DevContainer(
     [string]$Folder,
     [string]$WorkspaceVolume,
     [string]$HomeVolume,
+    [string]$ClaudeHomeVolume,
     [string]$ExtensionVolume
 ) {
     $wantedFolder = Normalize-ComparablePath $Folder
     $wantedConfig = Normalize-ComparablePath (Join-Path $Folder ".devcontainer\devcontainer.json")
-
     $containers = @(Get-DockerContainers $Docker)
 
-    # 1. Bevorzugt: exakt der Workspace-Ordner.
     foreach ($c in $containers) {
         if ((Normalize-ComparablePath $c.LocalFolder) -eq $wantedFolder) {
             Write-Host "Dev Container über devcontainer.local_folder erkannt."
             return $c.ShortId
         }
     }
-
-    # 2. Ebenfalls eindeutig: exakt die verwendete devcontainer.json.
     foreach ($c in $containers) {
         if ((Normalize-ComparablePath $c.ConfigFile) -eq $wantedConfig) {
             Write-Host "Dev Container über devcontainer.config_file erkannt."
@@ -1357,55 +1528,27 @@ function Find-DevContainer(
         }
     }
 
-    # 3. Sichere Rückfallebene für dieses Setup:
-    #    genau ein Container besitzt ALLE von uns eigens angelegten Kern-Volumes.
     $volumeMatches = @()
-
     foreach ($c in $containers) {
         $hasWorkspace = $false
-        $hasHome = $false
+        $hasAssistantHome = $false
         $hasExtensions = $false
-
         foreach ($m in @($c.Mounts)) {
-            if (
-                $m.Destination -eq "/workspaces" -and
-                ($m.Name -eq $WorkspaceVolume -or $m.Source -eq $WorkspaceVolume -or $m.Source -like "*\$WorkspaceVolume")
-            ) {
-                $hasWorkspace = $true
-            }
-
-            if (
-                $m.Destination -eq "/home/vscode/.codex" -and
-                ($m.Name -eq $HomeVolume -or $m.Source -eq $HomeVolume -or $m.Source -like "*\$HomeVolume")
-            ) {
-                $hasHome = $true
-            }
-
-            if (
-                $m.Destination -eq "/home/vscode/.vscode-server/extensions" -and
-                ($m.Name -eq $ExtensionVolume -or $m.Source -eq $ExtensionVolume -or $m.Source -like "*\$ExtensionVolume")
-            ) {
-                $hasExtensions = $true
-            }
+            if ($m.Destination -eq "/workspaces" -and ($m.Name -eq $WorkspaceVolume -or $m.Source -eq $WorkspaceVolume -or $m.Source -like "*\$WorkspaceVolume")) { $hasWorkspace = $true }
+            if ($m.Destination -eq "/home/vscode/.codex" -and ($m.Name -eq $HomeVolume -or $m.Source -eq $HomeVolume -or $m.Source -like "*\$HomeVolume")) { $hasAssistantHome = $true }
+            if ($m.Destination -eq "/home/vscode/.claude" -and ($m.Name -eq $ClaudeHomeVolume -or $m.Source -eq $ClaudeHomeVolume -or $m.Source -like "*\$ClaudeHomeVolume")) { $hasAssistantHome = $true }
+            if ($m.Destination -eq "/home/vscode/.vscode-server/extensions" -and ($m.Name -eq $ExtensionVolume -or $m.Source -eq $ExtensionVolume -or $m.Source -like "*\$ExtensionVolume")) { $hasExtensions = $true }
         }
-
-        if ($hasWorkspace -and $hasHome -and $hasExtensions) {
-            $volumeMatches += $c
-        }
+        if ($hasWorkspace -and ($hasAssistantHome -or $hasExtensions)) { $volumeMatches += $c }
     }
 
     if ($volumeMatches.Count -eq 1) {
-        Write-Host "Dev Container über die drei eindeutigen Codex-Volumes erkannt."
+        Write-Host "Dev Container über die eindeutigen Setup-Volumes erkannt."
         return $volumeMatches[0].ShortId
     }
 
-    # Wenn keine eindeutige Zuordnung möglich war, alles Relevante ins Log schreiben.
     Write-DevContainerDiagnostics $containers
-
-    if ($volumeMatches.Count -gt 1) {
-        Write-Warning "Mehrere Container verwenden dieselben Codex-Volumes; automatische Auswahl wäre unsicher."
-    }
-
+    if ($volumeMatches.Count -gt 1) { Write-Warning "Mehrere Container verwenden dieselben Setup-Volumes; automatische Auswahl wäre unsicher." }
     return $null
 }
 
@@ -2112,55 +2255,46 @@ function Find-ExistingCodexContainerForPreflight(
     [string]$Docker,
     [string]$Folder,
     [string]$WorkspaceVolume,
-    [string]$HomeVolume
+    [string]$HomeVolume,
+    [string]$ClaudeHomeVolume,
+    [string]$ExtensionVolume
 ) {
     $wantedFolder = Normalize-ComparablePath $Folder
     $wantedConfig = Normalize-ComparablePath (Join-Path $Folder ".devcontainer\devcontainer.json")
     $containers = @(Get-DockerContainers $Docker)
 
     foreach ($c in $containers) {
-        if ($c.LocalFolder -and (Normalize-ComparablePath $c.LocalFolder) -eq $wantedFolder) {
-            return $c.ShortId
-        }
+        if ($c.LocalFolder -and (Normalize-ComparablePath $c.LocalFolder) -eq $wantedFolder) { return $c.ShortId }
     }
-
     foreach ($c in $containers) {
-        if ($c.ConfigFile -and (Normalize-ComparablePath $c.ConfigFile) -eq $wantedConfig) {
-            return $c.ShortId
-        }
+        if ($c.ConfigFile -and (Normalize-ComparablePath $c.ConfigFile) -eq $wantedConfig) { return $c.ShortId }
     }
 
     $matches = @()
-
     foreach ($c in $containers) {
         $hasWorkspace = $false
-        $hasHome = $false
+        $hasAssistantState = $false
+        $hasExtensions = $false
 
         foreach ($m in $c.Mounts) {
-            if (
-                $m.Destination -eq "/workspaces" -and
-                ($m.Name -eq $WorkspaceVolume -or $m.Source -eq $WorkspaceVolume -or $m.Source -like "*\$WorkspaceVolume")
-            ) {
+            if ($m.Destination -eq "/workspaces" -and ($m.Name -eq $WorkspaceVolume -or $m.Source -eq $WorkspaceVolume -or $m.Source -like "*\$WorkspaceVolume")) {
                 $hasWorkspace = $true
             }
-
-            if (
-                $m.Destination -eq "/home/vscode/.codex" -and
-                ($m.Name -eq $HomeVolume -or $m.Source -eq $HomeVolume -or $m.Source -like "*\$HomeVolume")
-            ) {
-                $hasHome = $true
+            if ($m.Destination -eq "/home/vscode/.codex" -and ($m.Name -eq $HomeVolume -or $m.Source -eq $HomeVolume -or $m.Source -like "*\$HomeVolume")) {
+                $hasAssistantState = $true
+            }
+            if ($m.Destination -eq "/home/vscode/.claude" -and ($m.Name -eq $ClaudeHomeVolume -or $m.Source -eq $ClaudeHomeVolume -or $m.Source -like "*\$ClaudeHomeVolume")) {
+                $hasAssistantState = $true
+            }
+            if ($m.Destination -eq "/home/vscode/.vscode-server/extensions" -and ($m.Name -eq $ExtensionVolume -or $m.Source -eq $ExtensionVolume -or $m.Source -like "*\$ExtensionVolume")) {
+                $hasExtensions = $true
             }
         }
 
-        if ($hasWorkspace -and $hasHome) {
-            $matches += $c
-        }
+        if ($hasWorkspace -and ($hasAssistantState -or $hasExtensions)) { $matches += $c }
     }
 
-    if ($matches.Count -eq 1) {
-        return $matches[0].ShortId
-    }
-
+    if ($matches.Count -eq 1) { return $matches[0].ShortId }
     return $null
 }
 
@@ -2169,6 +2303,7 @@ function Get-ContainerPreflightMountState(
     [string]$ContainerId,
     [string]$WorkspaceVolume,
     [string]$HomeVolume,
+    [string]$ClaudeHomeVolume,
     [string]$ExtensionVolume
 ) {
     $containers = @(Get-DockerContainers $Docker)
@@ -2177,32 +2312,23 @@ function Get-ContainerPreflightMountState(
     $state = [ordered]@{
         HasWorkspaceVolume = $false
         HasHomeVolume = $false
+        HasClaudeHomeVolume = $false
         HasExtensionVolume = $false
     }
 
-    if (-not $container) {
-        return [pscustomobject]$state
-    }
+    if (-not $container) { return [pscustomobject]$state }
 
     foreach ($m in $container.Mounts) {
-        if (
-            $m.Destination -eq "/workspaces" -and
-            ($m.Name -eq $WorkspaceVolume -or $m.Source -eq $WorkspaceVolume -or $m.Source -like "*\$WorkspaceVolume")
-        ) {
+        if ($m.Destination -eq "/workspaces" -and ($m.Name -eq $WorkspaceVolume -or $m.Source -eq $WorkspaceVolume -or $m.Source -like "*\$WorkspaceVolume")) {
             $state.HasWorkspaceVolume = $true
         }
-
-        if (
-            $m.Destination -eq "/home/vscode/.codex" -and
-            ($m.Name -eq $HomeVolume -or $m.Source -eq $HomeVolume -or $m.Source -like "*\$HomeVolume")
-        ) {
+        if ($m.Destination -eq "/home/vscode/.codex" -and ($m.Name -eq $HomeVolume -or $m.Source -eq $HomeVolume -or $m.Source -like "*\$HomeVolume")) {
             $state.HasHomeVolume = $true
         }
-
-        if (
-            $m.Destination -eq "/home/vscode/.vscode-server/extensions" -and
-            ($m.Name -eq $ExtensionVolume -or $m.Source -eq $ExtensionVolume -or $m.Source -like "*\$ExtensionVolume")
-        ) {
+        if ($m.Destination -eq "/home/vscode/.claude" -and ($m.Name -eq $ClaudeHomeVolume -or $m.Source -eq $ClaudeHomeVolume -or $m.Source -like "*\$ClaudeHomeVolume")) {
+            $state.HasClaudeHomeVolume = $true
+        }
+        if ($m.Destination -eq "/home/vscode/.vscode-server/extensions" -and ($m.Name -eq $ExtensionVolume -or $m.Source -eq $ExtensionVolume -or $m.Source -like "*\$ExtensionVolume")) {
             $state.HasExtensionVolume = $true
         }
     }
@@ -2590,6 +2716,28 @@ exit 1
     return ($result.ExitCode -eq 0)
 }
 
+
+function Test-ClaudeCodePresentPreflight(
+    [string]$Docker,
+    [string]$ContainerId
+) {
+    if (-not (Wait-ContainerExecReady $Docker $ContainerId 20)) { return $false }
+
+    $script = @'
+if command -v claude >/dev/null 2>&1; then exit 0; fi
+for base in /home/vscode/.vscode-server/extensions /home/vscode/.vscode-server-insiders/extensions /vscode/vscode-server/extensions; do
+    [ -d "$base" ] || continue
+    if find "$base" -mindepth 1 -maxdepth 1 -type d -name 'anthropic.claude-code-*' -print -quit 2>/dev/null | grep -q .; then
+        exit 0
+    fi
+done
+exit 1
+'@
+
+    $result = Invoke-DockerNoThrow $Docker @('exec','-u','vscode',$ContainerId,'sh','-c',$script)
+    return ($result.ExitCode -eq 0)
+}
+
 function Get-DevContainerMountValue([object]$Mount, [string]$Name) {
     if ($null -eq $Mount) { return $null }
 
@@ -2708,6 +2856,8 @@ function Get-ProtectedWindowsMountRules {
             @('.kube', 'Kubernetes-Konfigurationen und Tokens dürfen nicht als Projekt-Mount freigegeben werden.'),
             @('.docker', 'Docker-Konfigurationen können Registry-Zugangsdaten enthalten.'),
             @('.codex', 'Lokale Codex-Daten und Anmeldedaten dürfen nicht als Projekt-Mount freigegeben werden.'),
+            @('.claude', 'Claude-Code-Konfiguration, Chats und Anmeldedaten dürfen nicht als Projekt-Mount freigegeben werden.'),
+            @('.claude.json', 'Claude-Code-App-Status und Anmeldedaten dürfen nicht als Projekt-Mount freigegeben werden.'),
             @('.vscode', 'VS-Code-Benutzerdaten sollen nicht als Projekt-Mount freigegeben werden.'),
             @('.config', 'Benutzerspezifische Konfigurationen können Zugangsdaten enthalten.')
         )
@@ -2850,13 +3000,13 @@ function Get-DevContainerVolumePrefix([string]$ConfigPath) {
         foreach ($mount in @($cfg.mounts)) {
             $source = Get-DevContainerMountValue $mount "source"
             $target = Get-DevContainerMountValue $mount "target"
-            if ($source -and ($target -eq "/workspaces" -or $target -eq "/home/vscode/.codex" -or $target -eq "/home/vscode/.vscode-server/extensions")) {
+            if ($source -and ($target -eq "/workspaces" -or $target -eq "/home/vscode/.codex" -or $target -eq "/home/vscode/.claude" -or $target -eq "/home/vscode/.vscode-server/extensions")) {
                 $sources += [string]$source
             }
         }
 
         foreach ($source in @($sources | Select-Object -Unique)) {
-            foreach ($suffix in @("-workspaces", "-home", "-vscode-extensions")) {
+            foreach ($suffix in @("-workspaces", "-home", "-claude-home", "-vscode-extensions")) {
                 if ($source.EndsWith($suffix, [StringComparison]::OrdinalIgnoreCase)) {
                     return $source.Substring(0, $source.Length - $suffix.Length)
                 }
@@ -2876,12 +3026,18 @@ function Test-CodexDevContainerConfiguration([string]$ConfigPath) {
     }
 
     try {
-        # Unter "Dokumente" koennen auch voellig fremde Dev-Container liegen.
-        # Erst nach eindeutigen Codex-Merkmalen suchen und nur dann JSON parsen.
-        # So erzeugen unbeteiligte JSON/JSONC-Dateien keine ConvertFrom-Json-
-        # Fehlermeldungen waehrend der stillen Bestandsaufnahme.
+        # Historischer Funktionsname; erkannt werden inzwischen sowohl Codex-
+        # als auch Claude-Code-Devcontainer. Fremde Dev-Container unter
+        # "Dokumente" sollen weiterhin ignoriert werden.
         $raw = Get-Content -LiteralPath $ConfigPath -Raw -ErrorAction Stop
-        if ($raw -notmatch 'CODEX_' -and $raw -notmatch '/home/vscode/\.codex') {
+        if (
+            $raw -notmatch 'CODEX_' -and
+            $raw -notmatch '/home/vscode/\.codex' -and
+            $raw -notmatch '/home/vscode/\.claude' -and
+            $raw -notmatch 'openai\.chatgpt' -and
+            $raw -notmatch 'anthropic\.claude-code' -and
+            $raw -notmatch 'CLAUDE_CONFIG_DIR'
+        ) {
             return $false
         }
 
@@ -2889,17 +3045,19 @@ function Test-CodexDevContainerConfiguration([string]$ConfigPath) {
 
         if ($cfg.build -and $cfg.build.args) {
             foreach ($property in @($cfg.build.args.PSObject.Properties)) {
-                if ([string]$property.Name -like "CODEX_*") {
-                    return $true
-                }
+                if ([string]$property.Name -like "CODEX_*") { return $true }
+            }
+        }
+
+        if ($cfg.customizations -and $cfg.customizations.vscode -and $cfg.customizations.vscode.extensions) {
+            foreach ($id in @($cfg.customizations.vscode.extensions)) {
+                if ([string]$id -in @('openai.chatgpt','anthropic.claude-code')) { return $true }
             }
         }
 
         foreach ($mount in @($cfg.mounts)) {
             $target = Get-DevContainerMountValue $mount "target"
-            if ($target -eq "/home/vscode/.codex") {
-                return $true
-            }
+            if ($target -eq "/home/vscode/.codex" -or $target -eq "/home/vscode/.claude") { return $true }
         }
     }
     catch {
@@ -2999,8 +3157,8 @@ function Show-CodexDevContainerCandidate([object]$Candidate, [int]$Number = 0) {
 }
 
 function Select-CodexDevContainerCandidate([object[]]$Candidates) {
-    Step "Vorhandene Codex-Umgebung auswählen"
-    Write-Host "Mehrere bestehende Codex-Devcontainer wurden vollständig vorgeprüft."
+    Step "Vorhandene KI-Devcontainer auswählen"
+    Write-Host "Mehrere bestehende KI-Devcontainer wurden vollständig vorgeprüft."
     Write-Host "Welche Umgebung soll dieses Setup verwenden?"
     Write-Host ""
 
@@ -3022,70 +3180,120 @@ function Select-CodexDevContainerCandidate([object[]]$Candidates) {
 
 function Update-ExistingDevContainerForExtensionPersistence(
     [string]$ConfigPath,
-    [string]$ExtensionVolume
+    [string]$ExtensionVolume,
+    [string]$CodexHomeVolume,
+    [string]$ClaudeHomeVolume,
+    [bool]$UseCodex,
+    [bool]$UseClaude
 ) {
     $raw = Get-Content -LiteralPath $ConfigPath -Raw -ErrorAction Stop
     $cfg = $raw | ConvertFrom-Json -ErrorAction Stop
     $changed = $false
 
     $mounts = @($cfg.mounts)
-    $hasExtensionMount = $false
-
-    foreach ($mount in $mounts) {
-        if ((Get-DevContainerMountValue $mount "target") -eq "/home/vscode/.vscode-server/extensions") {
-            $hasExtensionMount = $true
-            break
+    function Has-MountTarget([string]$Target) {
+        foreach ($mount in $mounts) {
+            if ((Get-DevContainerMountValue $mount 'target') -eq $Target) { return $true }
         }
+        return $false
     }
 
-    if (-not $hasExtensionMount) {
+    if (-not (Has-MountTarget '/home/vscode/.vscode-server/extensions')) {
         $mounts += "source=$ExtensionVolume,target=/home/vscode/.vscode-server/extensions,type=volume"
-        if ($cfg.PSObject.Properties["mounts"]) {
-            $cfg.mounts = @($mounts)
-        } else {
-            $cfg | Add-Member -NotePropertyName "mounts" -NotePropertyValue @($mounts)
-        }
+        $changed = $true
+    }
+    if ($UseCodex -and -not (Has-MountTarget '/home/vscode/.codex')) {
+        $mounts += "source=$CodexHomeVolume,target=/home/vscode/.codex,type=volume"
+        $changed = $true
+    }
+    if ($UseClaude -and -not (Has-MountTarget '/home/vscode/.claude')) {
+        $mounts += "source=$ClaudeHomeVolume,target=/home/vscode/.claude,type=volume"
         $changed = $true
     }
 
+    if ($cfg.PSObject.Properties['mounts']) { $cfg.mounts = @($mounts) }
+    else { $cfg | Add-Member -NotePropertyName 'mounts' -NotePropertyValue @($mounts) }
+
     if (
-        $cfg.PSObject.Properties["build"] -and
-        $cfg.build -and
-        $cfg.build.PSObject.Properties["args"] -and
-        $cfg.build.args -and
-        $cfg.build.args.PSObject.Properties["CODEX_BASE_IMAGE"] -and
-        ([string]$cfg.build.args.CODEX_BASE_IMAGE) -eq "mcr.microsoft.com/devcontainers/base:ubuntu"
+        $cfg.PSObject.Properties['build'] -and $cfg.build -and
+        $cfg.build.PSObject.Properties['args'] -and $cfg.build.args -and
+        $cfg.build.args.PSObject.Properties['CODEX_BASE_IMAGE'] -and
+        ([string]$cfg.build.args.CODEX_BASE_IMAGE) -eq 'mcr.microsoft.com/devcontainers/base:ubuntu'
     ) {
-        $cfg.build.args.CODEX_BASE_IMAGE = "mcr.microsoft.com/devcontainers/base:ubuntu-24.04"
+        $cfg.build.args.CODEX_BASE_IMAGE = 'mcr.microsoft.com/devcontainers/base:ubuntu-24.04'
         Write-Host "Legacy-Base-Image ':ubuntu' wurde auf das festgelegte ':ubuntu-24.04' angeheftet." -ForegroundColor Green
         $changed = $true
     }
 
-    $permissionCommand = 'sudo chown vscode:vscode /home/vscode/.vscode-server/extensions && chmod 755 /home/vscode/.vscode-server/extensions'
-    $postCreateProperty = $cfg.PSObject.Properties["postCreateCommand"]
+    if (-not $cfg.PSObject.Properties['customizations']) {
+        $cfg | Add-Member -NotePropertyName 'customizations' -NotePropertyValue ([pscustomobject]@{})
+    }
+    if (-not $cfg.customizations.PSObject.Properties['vscode']) {
+        $cfg.customizations | Add-Member -NotePropertyName 'vscode' -NotePropertyValue ([pscustomobject]@{})
+    }
 
+    $wantedExtensions = @()
+    if ($UseCodex) { $wantedExtensions += 'openai.chatgpt' }
+    if ($UseClaude) { $wantedExtensions += 'anthropic.claude-code' }
+    $extensions = @()
+    if ($cfg.customizations.vscode.PSObject.Properties['extensions']) {
+        $extensions = @($cfg.customizations.vscode.extensions)
+    }
+    foreach ($id in $wantedExtensions) {
+        if (@($extensions | ForEach-Object { ([string]$_).ToLowerInvariant() }) -notcontains $id.ToLowerInvariant()) {
+            $extensions += $id
+            $changed = $true
+        }
+    }
+    if ($cfg.customizations.vscode.PSObject.Properties['extensions']) { $cfg.customizations.vscode.extensions = @($extensions) }
+    else { $cfg.customizations.vscode | Add-Member -NotePropertyName 'extensions' -NotePropertyValue @($extensions) }
+
+    if ($UseClaude) {
+        if (-not $cfg.PSObject.Properties['containerEnv']) {
+            $cfg | Add-Member -NotePropertyName 'containerEnv' -NotePropertyValue ([pscustomobject]@{})
+        }
+        if (-not $cfg.containerEnv.PSObject.Properties['CLAUDE_CONFIG_DIR']) {
+            $cfg.containerEnv | Add-Member -NotePropertyName 'CLAUDE_CONFIG_DIR' -NotePropertyValue '/home/vscode/.claude'
+            $changed = $true
+        }
+    }
+
+    $permissionCommands = @(
+        [pscustomobject]@{ Key='assistantExtensionVolumePermissions'; Needle='/home/vscode/.vscode-server/extensions'; Command='sudo chown vscode:vscode /home/vscode/.vscode-server/extensions && chmod 755 /home/vscode/.vscode-server/extensions' }
+    )
+    if ($UseCodex) {
+        $permissionCommands += [pscustomobject]@{ Key='codexHomePermissions'; Needle='/home/vscode/.codex'; Command='sudo chown -R vscode:vscode /home/vscode/.codex && chmod 700 /home/vscode/.codex' }
+    }
+    if ($UseClaude) {
+        $permissionCommands += [pscustomobject]@{ Key='claudeHomePermissions'; Needle='/home/vscode/.claude'; Command='sudo chown -R vscode:vscode /home/vscode/.claude && chmod 700 /home/vscode/.claude' }
+    }
+
+    $postCreateProperty = $cfg.PSObject.Properties['postCreateCommand']
     if (-not $postCreateProperty) {
-        $cfg | Add-Member -NotePropertyName "postCreateCommand" -NotePropertyValue $permissionCommand
+        $cfg | Add-Member -NotePropertyName 'postCreateCommand' -NotePropertyValue (($permissionCommands | ForEach-Object { $_.Command }) -join ' && ')
         $changed = $true
     }
     elseif ($cfg.postCreateCommand -is [string]) {
-        if ([string]$cfg.postCreateCommand -notlike "*/home/vscode/.vscode-server/extensions*") {
-            $cfg.postCreateCommand = ([string]$cfg.postCreateCommand).Trim() + " && " + $permissionCommand
-            $changed = $true
+        $post = [string]$cfg.postCreateCommand
+        foreach ($perm in $permissionCommands) {
+            if ($post -notlike ('*' + $perm.Needle + '*')) {
+                $post = $post.Trim() + ' && ' + $perm.Command
+                $changed = $true
+            }
         }
+        $cfg.postCreateCommand = $post
     }
     else {
         $postObject = $cfg.postCreateCommand
-        if (-not $postObject.PSObject.Properties["codexExtensionVolumePermissions"]) {
-            $postObject | Add-Member -NotePropertyName "codexExtensionVolumePermissions" -NotePropertyValue $permissionCommand
-            $changed = $true
+        foreach ($perm in $permissionCommands) {
+            if (-not $postObject.PSObject.Properties[$perm.Key]) {
+                $postObject | Add-Member -NotePropertyName $perm.Key -NotePropertyValue $perm.Command
+                $changed = $true
+            }
         }
     }
 
-    if ($changed) {
-        Write-Utf8NoBom $ConfigPath ($cfg | ConvertTo-Json -Depth 30)
-    }
-
+    if ($changed) { Write-Utf8NoBom $ConfigPath ($cfg | ConvertTo-Json -Depth 30) }
     return $changed
 }
 
@@ -3101,7 +3309,11 @@ function Get-SetupPreflightState(
     $workspaceVolume = "$VolumePrefix-workspaces"
     $homeVolume = "$VolumePrefix-home"
     $extensionVolume = "$VolumePrefix-vscode-extensions"
+    $claudeHomeVolume = "$VolumePrefix-claude-home"
     $oldCodexHome = Join-Path $env:USERPROFILE ".codex"
+    $oldClaudeHome = Join-Path $env:USERPROFILE ".claude"
+    $oldClaudeGlobalState = Join-Path $env:USERPROFILE ".claude.json"
+    $assistantConfigState = Get-AssistantConfigState $configPath
 
     $state = [ordered]@{
         ConfigPath = $configPath
@@ -3113,6 +3325,13 @@ function Get-SetupPreflightState(
         NetworkDrives = @()
         LocalCodexHome = $oldCodexHome
         LocalHistory = Test-ImportableCodexHistory $oldCodexHome
+        LocalClaudeHome = $oldClaudeHome
+        LocalClaudeGlobalState = $oldClaudeGlobalState
+        CodexDetected = $false
+        ClaudeDetected = $false
+        CodexSignals = @()
+        ClaudeSignals = @()
+        ClaudeCodePresent = $false
         DockerCli = $null
         DockerReady = $false
         ContainerId = $null
@@ -3126,6 +3345,26 @@ function Get-SetupPreflightState(
         ExtensionVolumeContentKnown = $true
         UnsafeBindMounts = @()
     }
+
+    if ($assistantConfigState.Codex) { $state.CodexSignals += @($assistantConfigState.CodexSignals) }
+    if ($assistantConfigState.Claude) { $state.ClaudeSignals += @($assistantConfigState.ClaudeSignals) }
+
+    if (Test-Path -LiteralPath $oldCodexHome) {
+        $state.CodexSignals += 'lokales %USERPROFILE%\.codex vorhanden'
+    }
+    if (Test-LocalClaudeCodeUsage $oldClaudeHome $oldClaudeGlobalState) {
+        $state.ClaudeSignals += 'lokaler Claude-Code-Status unter %USERPROFILE% vorhanden'
+    }
+
+    foreach ($match in @(Get-HostVsCodeExtensionMatches 'openai.chatgpt')) {
+        $state.CodexSignals += "lokale VS-Code-Erweiterung: $match"
+    }
+    foreach ($match in @(Get-HostVsCodeExtensionMatches 'anthropic.claude-code')) {
+        $state.ClaudeSignals += "lokale VS-Code-Erweiterung: $match"
+    }
+
+    $hostClaude = Get-Command claude -ErrorAction SilentlyContinue
+    if ($hostClaude) { $state.ClaudeSignals += "Claude-Code-CLI im Windows-PATH: $($hostClaude.Source)" }
 
     if ($state.ExistingConfig) {
         $state.UnsafeBindMounts = @(Get-UnsafeDevContainerBindMounts $configPath)
@@ -3166,6 +3405,16 @@ function Get-SetupPreflightState(
     }
     catch {
         Write-Host "WSL-Bestand konnte in der frühen Prüfung noch nicht vollständig gelesen werden: $($_.Exception.Message)" -ForegroundColor Yellow
+    }
+
+    # Bereits laufende bzw. für Dev Containers konfigurierte WSL-Distros werden
+    # ebenfalls auf vorhandene Codex-/Claude-Code-Nutzung geprüft. Gestoppte,
+    # unbeteiligte Distros werden dafür nicht extra gestartet.
+    $assistantProbeDistros = @($state.ConfiguredWslDistro) + @($state.RunningWslDistros)
+    foreach ($assistantDistro in @($assistantProbeDistros | Where-Object { $_ } | Select-Object -Unique)) {
+        $wslAssistantState = Get-WslAssistantUsageState $assistantDistro
+        $state.CodexSignals += @($wslAssistantState.CodexSignals)
+        $state.ClaudeSignals += @($wslAssistantState.ClaudeSignals)
     }
 
     try {
@@ -3209,6 +3458,19 @@ function Get-SetupPreflightState(
 
     if (-not $state.DockerReady) {
         Write-Host "Vorhandene Docker-Container/Volumes können in dieser frühen Bestandsaufnahme noch nicht geprüft werden." -ForegroundColor Yellow
+
+        $state.CodexSignals = @($state.CodexSignals | Where-Object { $_ } | Select-Object -Unique)
+        $state.ClaudeSignals = @($state.ClaudeSignals | Where-Object { $_ } | Select-Object -Unique)
+        $state.CodexDetected = ($state.CodexSignals.Count -gt 0)
+        $state.ClaudeDetected = ($state.ClaudeSignals.Count -gt 0)
+
+        Write-Host "KI-Assistenten-Erkennung:" -ForegroundColor Cyan
+        Write-Host ("  OpenAI/Codex: " + $(if ($state.CodexDetected) { 'erkannt' } else { 'nicht erkannt' }))
+        foreach ($signal in $state.CodexSignals) { Write-Host "    - $signal" }
+        Write-Host ("  Claude Code:  " + $(if ($state.ClaudeDetected) { 'erkannt' } else { 'nicht erkannt' }))
+        foreach ($signal in $state.ClaudeSignals) { Write-Host "    - $signal" }
+
+        Write-Host "Bestandsaufnahme abgeschlossen. Erst ab jetzt können erforderliche Rückfragen folgen." -ForegroundColor Green
         return [pscustomobject]$state
     }
 
@@ -3218,11 +3480,26 @@ function Get-SetupPreflightState(
         $docker `
         $InstallDirectory `
         $workspaceVolume `
-        $homeVolume
+        $homeVolume `
+        $claudeHomeVolume `
+        $extensionVolume
 
     if (-not $state.ContainerId) {
         Write-Host "Passender bestehender Dev Container: nicht gefunden"
         Write-Host ("Persistentes Extensions-Volume: " + $(if ($state.ExtensionVolumeExists) { "vorhanden" } else { "nicht vorhanden" }))
+
+        $state.CodexSignals = @($state.CodexSignals | Where-Object { $_ } | Select-Object -Unique)
+        $state.ClaudeSignals = @($state.ClaudeSignals | Where-Object { $_ } | Select-Object -Unique)
+        $state.CodexDetected = ($state.CodexSignals.Count -gt 0)
+        $state.ClaudeDetected = ($state.ClaudeSignals.Count -gt 0)
+
+        Write-Host "KI-Assistenten-Erkennung:" -ForegroundColor Cyan
+        Write-Host ("  OpenAI/Codex: " + $(if ($state.CodexDetected) { 'erkannt' } else { 'nicht erkannt' }))
+        foreach ($signal in $state.CodexSignals) { Write-Host "    - $signal" }
+        Write-Host ("  Claude Code:  " + $(if ($state.ClaudeDetected) { 'erkannt' } else { 'nicht erkannt' }))
+        foreach ($signal in $state.ClaudeSignals) { Write-Host "    - $signal" }
+
+        Write-Host "Bestandsaufnahme abgeschlossen. Erst ab jetzt können erforderliche Rückfragen folgen." -ForegroundColor Green
         return [pscustomobject]$state
     }
 
@@ -3233,15 +3510,22 @@ function Get-SetupPreflightState(
         $state.ContainerId `
         $workspaceVolume `
         $homeVolume `
+        $claudeHomeVolume `
         $extensionVolume
 
     Write-Host ("  workspaces-Volume: " + $(if ($state.ContainerMounts.HasWorkspaceVolume) { "Ja" } else { "Nein" }))
     Write-Host ("  .codex-Volume:     " + $(if ($state.ContainerMounts.HasHomeVolume) { "Ja" } else { "Nein" }))
+    Write-Host ("  .claude-Volume:    " + $(if ($state.ContainerMounts.HasClaudeHomeVolume) { "Ja" } else { "Nein" }))
     Write-Host ("  Extensions-Volume: " + $(if ($state.ContainerMounts.HasExtensionVolume) { "Ja" } else { "Nein" }))
 
     if (Wait-ContainerExecReady $docker $state.ContainerId 20) {
         $state.CodexBinaryPresent = Test-CodexBinaryPresentPreflight $docker $state.ContainerId
         Write-Host ("  Codex-Binary:      " + $(if ($state.CodexBinaryPresent) { "vorhanden" } else { "nicht gefunden" }))
+        if ($state.CodexBinaryPresent) { $state.CodexSignals += 'Codex-Binary im vorhandenen Dev Container' }
+
+        $state.ClaudeCodePresent = Test-ClaudeCodePresentPreflight $docker $state.ContainerId
+        Write-Host ("  Claude Code:       " + $(if ($state.ClaudeCodePresent) { "vorhanden" } else { "nicht gefunden" }))
+        if ($state.ClaudeCodePresent) { $state.ClaudeSignals += 'Claude Code im vorhandenen Dev Container' }
 
         if ($state.LocalHistory.Importable -and $state.ContainerMounts.HasHomeVolume) {
             $state.LocalHistoryComparison = Test-SourceCodexHistoryPresentInContainer `
@@ -3270,6 +3554,12 @@ function Get-SetupPreflightState(
             Get-ContainerExtensionDirectoryNamesPreflight $docker $state.ContainerId
         )
         Write-Host "  Container-Extensions: $($state.ExistingExtensionNames.Count)"
+        if (@($state.ExistingExtensionNames | Where-Object { $_ -like 'openai.chatgpt-*' -or $_ -eq 'openai.chatgpt' }).Count -gt 0) {
+            $state.CodexSignals += 'OpenAI/Codex-Extension im vorhandenen Dev Container'
+        }
+        if (@($state.ExistingExtensionNames | Where-Object { $_ -like 'anthropic.claude-code-*' -or $_ -eq 'anthropic.claude-code' }).Count -gt 0) {
+            $state.ClaudeSignals += 'Claude-Code-Extension im vorhandenen Dev Container'
+        }
     }
     else {
         Write-Host "  Container konnte für Detailprüfungen nicht gestartet werden." -ForegroundColor Yellow
@@ -3299,6 +3589,18 @@ function Get-SetupPreflightState(
         "vorhanden und leer"
     }))
 
+
+    $state.CodexSignals = @($state.CodexSignals | Where-Object { $_ } | Select-Object -Unique)
+    $state.ClaudeSignals = @($state.ClaudeSignals | Where-Object { $_ } | Select-Object -Unique)
+    $state.CodexDetected = ($state.CodexSignals.Count -gt 0)
+    $state.ClaudeDetected = ($state.ClaudeSignals.Count -gt 0)
+
+    Write-Host "KI-Assistenten-Erkennung:" -ForegroundColor Cyan
+    Write-Host ("  OpenAI/Codex: " + $(if ($state.CodexDetected) { 'erkannt' } else { 'nicht erkannt' }))
+    foreach ($signal in $state.CodexSignals) { Write-Host "    - $signal" }
+    Write-Host ("  Claude Code:  " + $(if ($state.ClaudeDetected) { 'erkannt' } else { 'nicht erkannt' }))
+    foreach ($signal in $state.ClaudeSignals) { Write-Host "    - $signal" }
+
     Write-Host "Bestandsaufnahme abgeschlossen. Erst ab jetzt können erforderliche Rückfragen folgen." -ForegroundColor Green
     return [pscustomobject]$state
 }
@@ -3322,7 +3624,7 @@ Initialize-AtcDiagnosticLog
 Write-AtcCheckpoint "Setup-Prozess gestartet"
 
 Write-Host ""
-Write-Host "Fresh Codex Dev-Container Setup $script:SetupVersion" -ForegroundColor Green
+Write-Host "Fresh Codex + Claude Dev-Container Setup $script:SetupVersion" -ForegroundColor Green
 Write-Host "========================================"
 Write-Host "Start:       $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss zzz')"
 Write-Host "Computer:    $env:COMPUTERNAME"
@@ -3332,7 +3634,7 @@ Write-Host "Windows:     $([Environment]::OSVersion.VersionString)"
 Write-Host "Aufruf-Zielordner: $InstallDirectory"
 
 # Vor der ersten regulären Setup-Rückfrage werden zunächst alle vorhandenen
-# Codex-Devcontainer unter "Dokumente" gesucht. Jede gefundene Umgebung wird
+# KI-Devcontainer unter "Dokumente" gesucht. Jede gefundene Umgebung wird
 # soweit technisch möglich vollständig vorgeprüft. Genau ein Treffer wird
 # automatisch verwendet; nur bei mehreren Treffern ist danach eine Auswahl
 # erforderlich.
@@ -3344,12 +3646,12 @@ $preflight = $null
 
 if ($candidates.Count -eq 0) {
     Write-Host ""
-    Write-Host "Keine bestehende Codex-Devcontainer-Konfiguration unter 'Dokumente' gefunden."
+    Write-Host "Keine bestehende KI-Devcontainer-Konfiguration unter 'Dokumente' gefunden."
     $preflight = Get-SetupPreflightState $InstallDirectory $VolumePrefix
 }
 else {
     Write-Host ""
-    Write-Host "Gefundene bestehende Codex-Devcontainer: $($candidates.Count)" -ForegroundColor Green
+    Write-Host "Gefundene bestehende KI-Devcontainer: $($candidates.Count)" -ForegroundColor Green
 
     foreach ($candidate in $candidates) {
         Write-Host ""
@@ -3360,7 +3662,7 @@ else {
     if ($candidates.Count -eq 1) {
         $selectedCandidate = $candidates[0]
         Write-Host ""
-        Write-Host "Genau eine bestehende Codex-Umgebung gefunden; sie wird automatisch verwendet:" -ForegroundColor Green
+        Write-Host "Genau eine bestehende KI-Devcontainer-Umgebung gefunden; sie wird automatisch verwendet:" -ForegroundColor Green
         Show-CodexDevContainerCandidate $selectedCandidate
     }
     else {
@@ -3386,6 +3688,10 @@ $details
 "@
 }
 
+$assistantSelection = Select-AiAssistants $preflight
+$useCodex = [bool]$assistantSelection.Codex
+$useClaude = [bool]$assistantSelection.Claude
+
 # Eine bereits von Dev Containers verwendete WSL-Distro ist bei Wiederholung
 # des Setups die beste Vorgabe. Ein expliziter Parameter hat weiterhin Vorrang.
 if ([string]::IsNullOrWhiteSpace($UbuntuDistro) -and $preflight.ConfiguredWslDistro) {
@@ -3407,9 +3713,12 @@ $oldCodexHome = $preflight.LocalCodexHome
 $oldCodexDb = Join-Path $oldCodexHome "state_5.sqlite"
 $historyState = $preflight.LocalHistory
 $importChats = $false
-$offerChatImport = ($historyState.Importable -and -not $preflight.LocalHistoryAlreadyPresent)
+$offerChatImport = ($useCodex -and $historyState.Importable -and -not $preflight.LocalHistoryAlreadyPresent)
 
-if ($historyState.Importable -and $preflight.LocalHistoryAlreadyPresent) {
+if (-not $useCodex) {
+    Write-Host "OpenAI/Codex ist für diese Umgebung nicht ausgewählt; Codex-Chatimport wird übersprungen."
+}
+elseif ($historyState.Importable -and $preflight.LocalHistoryAlreadyPresent) {
     Write-Host "Vorhandene lokale Codex-Chats wurden bereits im persistenten Container-Home nachgewiesen." -ForegroundColor Green
     Write-Host "Ein erneuter Chatimport wird deshalb nicht angeboten." -ForegroundColor Green
 }
@@ -3423,6 +3732,7 @@ elseif (Test-Path -LiteralPath $oldCodexHome) {
 else {
     Write-Host "Keine bestehende lokale Codex-Historie gefunden."
 }
+
 
 Step "winget prüfen"
 
@@ -3549,6 +3859,7 @@ New-Item -ItemType Directory -Force -Path $devDir | Out-Null
 $homeVolume = "$VolumePrefix-home"
 $workspaceVolume = "$VolumePrefix-workspaces"
 $extensionVolume = "$VolumePrefix-vscode-extensions"
+$claudeHomeVolume = "$VolumePrefix-claude-home"
 $devContainerDefinitionChanged = $false
 $forceDevContainerRebuild = $false
 
@@ -3558,12 +3869,12 @@ if ($preflight.ExistingConfig) {
     Write-Host "  $configPath" -ForegroundColor Green
     Write-Host "Bestehende Mounts, VS-Code-Einstellungen und Build-Args bleiben erhalten."
 
-    $configChanged = Update-ExistingDevContainerForExtensionPersistence $configPath $extensionVolume
+    $configChanged = Update-ExistingDevContainerForExtensionPersistence $configPath $extensionVolume $homeVolume $claudeHomeVolume $useCodex $useClaude
     if ($configChanged) {
         $devContainerDefinitionChanged = $true
-        Write-Host "Vorhandene Konfiguration wurde gezielt aktualisiert (Extensions-Persistenz und/oder feste Base-Image-Version)." -ForegroundColor Green
+        Write-Host "Vorhandene Konfiguration wurde gezielt aktualisiert (KI-Assistenten, Persistenz und/oder feste Base-Image-Version)." -ForegroundColor Green
     } else {
-        Write-Host "Extensions-Persistenz ist bereits vollständig konfiguriert." -ForegroundColor Green
+        Write-Host "KI-Assistenten und Extensions-Persistenz sind bereits vollständig konfiguriert." -ForegroundColor Green
     }
 
     $dockerfilePath = Join-Path $devDir "Dockerfile.codex"
@@ -3609,7 +3920,7 @@ else {
     $devContainerDefinitionChanged = $true
 
     $config = [ordered]@{
-        name = "Codex Sandbox"
+        name = $(if ($useCodex -and $useClaude) { "Codex + Claude Sandbox" } elseif ($useClaude) { "Claude Code Sandbox" } else { "Codex Sandbox" })
         build = [ordered]@{
             dockerfile = "Dockerfile.codex"
             args = [ordered]@{
@@ -3623,30 +3934,32 @@ else {
         }
         workspaceMount = "source=$workspaceVolume,target=/workspaces,type=volume"
         workspaceFolder = "/workspaces"
-        mounts = @(
-            [ordered]@{
-                source = $homeVolume
-                target = "/home/vscode/.codex"
-                type = "volume"
-            }
-            [ordered]@{
-                source = $extensionVolume
-                target = "/home/vscode/.vscode-server/extensions"
-                type = "volume"
-            }
-        )
+        mounts = @()
         remoteUser = "vscode"
         customizations = [ordered]@{
             vscode = [ordered]@{
-                extensions = @("openai.chatgpt")
+                extensions = @()
                 settings = [ordered]@{
                     "files.exclude" = [ordered]@{ "/env/" = $true }
                     "editor.codeActionsOnSave" = [ordered]@{}
                 }
             }
         }
-        postCreateCommand = 'sudo chown -R vscode:vscode /home/vscode/.codex && chmod 700 /home/vscode/.codex && sudo chown vscode:vscode /home/vscode/.vscode-server/extensions && chmod 755 /home/vscode/.vscode-server/extensions'
+        postCreateCommand = 'sudo chown vscode:vscode /home/vscode/.vscode-server/extensions && chmod 755 /home/vscode/.vscode-server/extensions'
     }
+
+    if ($useCodex) {
+        $config.mounts += [ordered]@{ source = $homeVolume; target = "/home/vscode/.codex"; type = "volume" }
+        $config.customizations.vscode.extensions += "openai.chatgpt"
+        $config.postCreateCommand += ' && sudo chown -R vscode:vscode /home/vscode/.codex && chmod 700 /home/vscode/.codex'
+    }
+    if ($useClaude) {
+        $config.mounts += [ordered]@{ source = $claudeHomeVolume; target = "/home/vscode/.claude"; type = "volume" }
+        $config.customizations.vscode.extensions += "anthropic.claude-code"
+        $config.containerEnv = [ordered]@{ CLAUDE_CONFIG_DIR = "/home/vscode/.claude" }
+        $config.postCreateCommand += ' && sudo chown -R vscode:vscode /home/vscode/.claude && chmod 700 /home/vscode/.claude'
+    }
+    $config.mounts += [ordered]@{ source = $extensionVolume; target = "/home/vscode/.vscode-server/extensions"; type = "volume" }
 
     Write-Utf8NoBom $configPath ($config | ConvertTo-Json -Depth 20)
     Write-Host "Erstellt: $dockerfilePath"
@@ -3763,8 +4076,15 @@ Write-Host "Docker Desktop und $UbuntuDistro verwenden dieselbe Docker Engine." 
 
 Step "Persistente Docker-Volumes anlegen"
 
-& $docker volume create $homeVolume
-if ($LASTEXITCODE -ne 0) { throw "Docker-Volume $homeVolume konnte nicht angelegt werden." }
+if ($useCodex) {
+    & $docker volume create $homeVolume
+    if ($LASTEXITCODE -ne 0) { throw "Docker-Volume $homeVolume konnte nicht angelegt werden." }
+}
+
+if ($useClaude) {
+    & $docker volume create $claudeHomeVolume
+    if ($LASTEXITCODE -ne 0) { throw "Docker-Volume $claudeHomeVolume konnte nicht angelegt werden." }
+}
 
 & $docker volume create $workspaceVolume
 if ($LASTEXITCODE -ne 0) { throw "Docker-Volume $workspaceVolume konnte nicht angelegt werden." }
@@ -3821,11 +4141,12 @@ function Ensure-VsCodeMarketplaceExtension([string]$Id, [string]$Label) {
 }
 
 Ensure-VsCodeMarketplaceExtension "ms-vscode-remote.remote-containers" "Dev Containers"
-Ensure-VsCodeMarketplaceExtension "openai.chatgpt" "OpenAI/Codex"
+if ($useCodex) { Ensure-VsCodeMarketplaceExtension "openai.chatgpt" "OpenAI/Codex" }
+if ($useClaude) { Ensure-VsCodeMarketplaceExtension "anthropic.claude-code" "Claude Code" }
 
-$mountVsix = Join-Path $PSScriptRoot "tools\codex-mount-manager-0.3.8.vsix"
+$mountVsix = Join-Path $PSScriptRoot "tools\codex-mount-manager-0.3.9.vsix"
 $mountManagerId = "zivi-local.codex-mount-manager"
-$mountManagerVersion = "0.3.8"
+$mountManagerVersion = "0.3.9"
 Write-AtcCheckpoint ("Codex Mount Manager VSIX pruefen: {0}" -f $mountVsix)
 
 if ($installedVsCodeExtensions.ContainsKey($mountManagerId) -and $installedVsCodeExtensions[$mountManagerId] -eq $mountManagerVersion) {
@@ -3840,7 +4161,7 @@ elseif (Test-Path -LiteralPath $mountVsix) {
         Write-AtcCheckpoint ("Codex Mount Manager VSIX Hash nicht lesbar: {0}" -f $_.Exception.Message)
     }
 
-    Write-AtcCheckpoint "BEFORE code --install-extension <codex-mount-manager-0.3.8.vsix> --force"
+    Write-AtcCheckpoint "BEFORE code --install-extension <codex-mount-manager-0.3.9.vsix> --force"
     & $code --install-extension $mountVsix --force
     $mountManagerExit = $LASTEXITCODE
     Write-AtcCheckpoint ("AFTER Codex Mount Manager ExitCode={0}" -f $mountManagerExit)
@@ -3926,6 +4247,69 @@ function Test-CodexBinaryInContainer([string]$Docker, [string]$ContainerId) {
         Found  = ($paths.Count -gt 0)
         Detail = (($paths -join "`n").Trim())
     }
+}
+
+
+function Get-ClaudeCodeDetailsInContainer([string]$Docker, [string]$ContainerId) {
+    $details = @()
+    $probe = Invoke-DockerNoThrow $Docker @(
+        'exec','-u','vscode',$ContainerId,'sh','-c',
+        'command -v claude 2>/dev/null || true; for base in /home/vscode/.vscode-server/extensions /home/vscode/.vscode-server-insiders/extensions /vscode/vscode-server/extensions; do [ -d "$base" ] || continue; find "$base" -mindepth 1 -maxdepth 1 -type d -name "anthropic.claude-code-*" -print 2>/dev/null; done'
+    )
+    foreach ($line in $probe.Output) {
+        $s = ([string]$line).Trim()
+        if ($s -and $details -notcontains $s) { $details += $s }
+    }
+    return [pscustomobject]@{ Found = ($details.Count -gt 0); Detail = (($details -join "`n").Trim()) }
+}
+
+function Test-SelectedAssistantsInContainer(
+    [string]$Docker,
+    [string]$ContainerId,
+    [bool]$UseCodex,
+    [bool]$UseClaude
+) {
+    $codex = if ($UseCodex) { Test-CodexBinaryInContainer $Docker $ContainerId } else { [pscustomobject]@{ Found=$true; Detail='' } }
+    $claude = if ($UseClaude) { Get-ClaudeCodeDetailsInContainer $Docker $ContainerId } else { [pscustomobject]@{ Found=$true; Detail='' } }
+    return [pscustomobject]@{ Codex=$codex; Claude=$claude; AllFound=($codex.Found -and $claude.Found) }
+}
+
+function Wait-ForSelectedAssistantsInContainer(
+    [string]$Docker,
+    [string]$ContainerId,
+    [bool]$UseCodex,
+    [bool]$UseClaude,
+    [int]$TimeoutSeconds = 120
+) {
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ((Get-Date) -lt $deadline) {
+        $running = (& $Docker inspect -f "{{.State.Running}}" $ContainerId 2>$null).Trim()
+        if ($running -ne 'true') { & $Docker start $ContainerId | Out-Null; Start-Sleep -Seconds 2 }
+        $state = Test-SelectedAssistantsInContainer $Docker $ContainerId $UseCodex $UseClaude
+        if ($state.AllFound) { return $state }
+        Start-Sleep -Seconds 2
+    }
+    return Test-SelectedAssistantsInContainer $Docker $ContainerId $UseCodex $UseClaude
+}
+
+function Try-CompleteSelectedAssistantRemoteInstall(
+    [string]$CodeCli,
+    [string]$Docker,
+    [string]$ContainerId,
+    [string]$HostWorkspace,
+    [bool]$UseCodex,
+    [bool]$UseClaude
+) {
+    Write-Host ""
+    Write-Host "Mindestens ein ausgewählter KI-Assistent fehlt noch im Dev Container."
+    Write-Host "Öffne VS Code direkt im vorhandenen Dev Container und warte auf die vollständige Remote-Extension-Installation..."
+    $remoteUri = Convert-WorkspacePathToDevContainerUri $HostWorkspace '/workspaces'
+    try { & $CodeCli --new-window --folder-uri $remoteUri }
+    catch {
+        Write-Warning "VS Code konnte nicht direkt im Dev Container geöffnet werden: $($_.Exception.Message)"
+        return Test-SelectedAssistantsInContainer $Docker $ContainerId $UseCodex $UseClaude
+    }
+    return Wait-ForSelectedAssistantsInContainer $Docker $ContainerId $UseCodex $UseClaude 120
 }
 
 function Convert-WorkspacePathToDevContainerUri(
@@ -4396,6 +4780,9 @@ if ($offerChatImport) {
     Write-AtcCheckpoint "BEFORE Chat-Migrationsfrage"
     $importChats = Ask-YesNo "Sollen diese vorhandenen Chats in die Container-Umgebung übernommen werden?" $true
     Write-AtcCheckpoint ("AFTER Chat-Migrationsfrage Auswahl={0}" -f $(if ($importChats) { "Ja" } else { "Nein" }))
+} elseif (-not $useCodex) {
+    Write-Host "Codex ist nicht ausgewählt; keine Chatimport-Rückfrage erforderlich."
+    Write-AtcCheckpoint "SKIP Chat-Migrationsfrage; Codex nicht ausgewählt"
 } elseif ($historyState.Importable -and $preflight.LocalHistoryAlreadyPresent) {
     Write-Host "Chatimport bereits erledigt; keine Rückfrage erforderlich." -ForegroundColor Green
     Write-AtcCheckpoint "SKIP Chat-Migrationsfrage; Historie bereits nachgewiesen"
@@ -4405,49 +4792,28 @@ if ($offerChatImport) {
 }
 Write-AtcCheckpoint "END Abschnitt Offene Chat-Migration pruefen"
 
-Step "Vorhandenen Dev Container und Codex prüfen"
+Step "Vorhandenen Dev Container und KI-Assistenten prüfen"
 
 $containerId = if ($forceDevContainerRebuild) { $null } else { $preflight.ContainerId }
 if (-not $containerId -and -not $forceDevContainerRebuild) {
-    $containerId = Find-DevContainer $docker $InstallDirectory $workspaceVolume $homeVolume $extensionVolume
+    $containerId = Find-DevContainer $docker $InstallDirectory $workspaceVolume $homeVolume $claudeHomeVolume $extensionVolume
 }
 $needsVsCodeBootstrap = $true
 
 if ($containerId) {
     Write-Host "Vorhandener Dev Container gefunden: $containerId"
-
     if (Start-ContainerAndWaitForExec $docker $containerId) {
-        $existingOpenAi = Test-OpenAiPresentForBootstrap $docker $containerId
-
-        if ($existingOpenAi.Found) {
-            Write-Host "OpenAI/Codex ist im vorhandenen Dev Container bereits vorhanden." -ForegroundColor Green
-
-            if ($existingOpenAi.Detail) {
-                Write-Host "Erkannt über:"
-                $existingOpenAi.Detail -split "`r?`n" | ForEach-Object {
-                    Write-Host "  $_"
-                }
-            }
-
-            Write-Host ""
-            Write-Host "VS Code muss NICHT erneut für den Container-Aufbau geöffnet werden." -ForegroundColor Green
+        $assistantStatus = Test-SelectedAssistantsInContainer $docker $containerId $useCodex $useClaude
+        if ($assistantStatus.AllFound) {
+            Write-Host "Alle ausgewählten KI-Assistenten sind im vorhandenen Dev Container bereits vorhanden." -ForegroundColor Green
             $needsVsCodeBootstrap = $false
         }
         else {
-            Write-Host "Der Dev Container existiert bereits, aber der echte Codex-Binary wurde darin noch nicht gefunden."
-            Write-Host "Ein Download/Cache-Eintrag allein zählt nicht als vollständige Installation."
-            Write-Host "Fehlende optionale VS-Code-Server-Verzeichnisse (z.B. Insiders) werden ignoriert."
-
-            $autoOpenAi = Try-CompleteOpenAiRemoteInstall `
-                $code `
-                $docker `
-                $containerId `
-                $InstallDirectory
-
-            if ($autoOpenAi.Found) {
-                Write-Host "Codex-Binary:"
-                Write-Host "  $($autoOpenAi.Detail)"
-                Write-Host "Der manuelle Bootstrap-Schritt wird übersprungen." -ForegroundColor Green
+            if ($useCodex -and -not $assistantStatus.Codex.Found) { Write-Host "OpenAI/Codex fehlt noch im Dev Container." -ForegroundColor Yellow }
+            if ($useClaude -and -not $assistantStatus.Claude.Found) { Write-Host "Claude Code fehlt noch im Dev Container." -ForegroundColor Yellow }
+            $assistantStatus = Try-CompleteSelectedAssistantRemoteInstall $code $docker $containerId $InstallDirectory $useCodex $useClaude
+            if ($assistantStatus.AllFound) {
+                Write-Host "Alle ausgewählten KI-Assistenten wurden vollständig im Dev Container installiert." -ForegroundColor Green
                 $needsVsCodeBootstrap = $false
             }
             else {
@@ -4478,8 +4844,10 @@ if ($needsVsCodeBootstrap) {
     $bootstrapReason = if ($forceDevContainerRebuild) {
         "Die Dev-Container-Konfiguration wurde geändert und der alte Container wurde entfernt."
     } else {
-        "Es wurde noch kein vollständig vorbereiteter Dev Container mit OpenAI/Codex erkannt."
+        "Es wurde noch kein vollständig vorbereiteter Dev Container mit den ausgewählten KI-Assistenten erkannt."
     }
+
+    $assistantLabel = if ($useCodex -and $useClaude) { 'OpenAI/Codex und Claude Code' } elseif ($useClaude) { 'Claude Code' } else { 'OpenAI/Codex' }
 
     Write-Host @"
 
@@ -4493,16 +4861,15 @@ Grund: $bootstrapReason
 
 3. Warten, bis VS Code vollständig im Container geöffnet ist.
 
-4. Unten links muss sinngemäß stehen:
-     Dev Container: Codex Sandbox
+4. Unten links muss der Dev Container angezeigt werden.
 
-5. Codex/Chat NOCH NICHT öffnen.
+5. $assistantLabel NOCH NICHT öffnen.
 
 6. VS Code GEÖFFNET LASSEN.
 
 7. Zu diesem PowerShell-Fenster wechseln und ENTER drücken.
 
-Die OpenAI/Codex-Extension musst du NICHT mehr manuell kontrollieren.
+Die ausgewählten KI-Erweiterungen musst du NICHT manuell kontrollieren.
 Das prüft das Setup anschließend selbst.
 
 Wichtig: VS Code bleibt während der restlichen Setup-Prüfungen geöffnet,
@@ -4511,21 +4878,15 @@ damit Dev Containers den Container nicht durch shutdownAction stoppt.
 "@
 
     & $code -n $InstallDirectory
-
     Read-Host "Wenn der Dev Container vollständig geöffnet ist, VS Code GEÖFFNET LASSEN und hier ENTER drücken"
     Write-Host "VS-Code-/Dev-Container-Aufbau wurde vom Benutzer bestätigt."
-
     Write-Host "Suche den erzeugten Dev Container..."
 
     $containerId = $null
     $deadline = (Get-Date).AddSeconds(60)
-
     while (-not $containerId -and (Get-Date) -lt $deadline) {
-        $containerId = Find-DevContainer $docker $InstallDirectory $workspaceVolume $homeVolume $extensionVolume
-
-        if (-not $containerId) {
-            Start-Sleep -Seconds 3
-        }
+        $containerId = Find-DevContainer $docker $InstallDirectory $workspaceVolume $homeVolume $claudeHomeVolume $extensionVolume
+        if (-not $containerId) { Start-Sleep -Seconds 3 }
     }
 
     if (-not $containerId) {
@@ -4565,79 +4926,51 @@ if (-not $containerReady) {
     throw "Dev Container '$containerId' läuft, akzeptiert aber noch keine docker-exec-Aufrufe."
 }
 
-Step "OpenAI/Codex-Extension im Dev Container prüfen"
+Step "KI-Assistenten im Dev Container prüfen"
 
-function Test-OpenAiExtensionInContainer([string]$Docker, [string]$ContainerId) {
-    return Test-CodexBinaryInContainer $Docker $ContainerId
-}
-
-Write-Host "Prüfe den tatsächlich installierten Codex-Binary..."
-
-$openaiResult = $null
+$assistantStatus = $null
 $deadline = (Get-Date).AddSeconds(30)
-
 while ((Get-Date) -lt $deadline) {
-    # Der Container kann nach dem Schließen des letzten VS-Code-Fensters
-    # automatisch wieder gestoppt worden sein. Dann erneut starten.
     $running = (& $docker inspect -f "{{.State.Running}}" $containerId 2>$null).Trim()
-
-    if ($running -ne "true") {
+    if ($running -ne 'true') {
         Write-Host "Dev Container wurde gestoppt; starte ihn erneut..."
         & $docker start $containerId | Out-Null
         Start-Sleep -Seconds 2
     }
-
-    $openaiResult = Test-OpenAiExtensionInContainer $docker $containerId
-
-    if ($openaiResult.Found) {
-        break
-    }
-
+    $assistantStatus = Test-SelectedAssistantsInContainer $docker $containerId $useCodex $useClaude
+    if ($assistantStatus.AllFound) { break }
     Start-Sleep -Seconds 2
 }
 
-if (-not $openaiResult -or -not $openaiResult.Found) {
+if (-not $assistantStatus -or -not $assistantStatus.AllFound) {
     Write-Host ""
-    Write-Host "Codex-Binary fehlt noch. Versuche einmal die automatische Remote-Installation..." -ForegroundColor Yellow
+    Write-Host "Mindestens ein ausgewählter KI-Assistent fehlt noch. Versuche einmal die automatische Remote-Installation..." -ForegroundColor Yellow
+    $assistantStatus = Try-CompleteSelectedAssistantRemoteInstall $code $docker $containerId $InstallDirectory $useCodex $useClaude
+}
 
-    $openaiResult = Try-CompleteOpenAiRemoteInstall `
-        $code `
-        $docker `
-        $containerId `
-        $InstallDirectory
+if (-not $assistantStatus.AllFound) {
+    Write-Host ""
+    Write-Host "Diagnose der VS-Code-Server-Verzeichnisse:" -ForegroundColor Yellow
+    & $docker exec -u vscode $containerId sh -c "command -v claude 2>/dev/null || true; find /home/vscode/.vscode-server /vscode/vscode-server -maxdepth 4 \( -iname '*openai*' -o -iname '*anthropic*' -o -iname '*claude*' \) 2>/dev/null | head -n 150"
+    throw "Mindestens ein ausgewählter KI-Assistent wurde im Dev Container nicht vollständig installiert."
+}
 
-    if (-not $openaiResult.Found) {
-        Write-Host ""
-        Write-Host "Diagnose der VS-Code-Server-Verzeichnisse:" -ForegroundColor Yellow
-
-        & $docker exec -u vscode $containerId sh -c `
-            "find /home/vscode/.vscode-server /vscode/vscode-server -maxdepth 4 -iname '*openai*' 2>/dev/null | head -n 100"
-
-        throw @"
-OpenAI/Codex wurde möglicherweise bereits heruntergeladen, aber der tatsächliche
-Codex-Binary ist im Dev Container noch nicht installiert.
-
-Erwartet wird ein Pfad ähnlich:
-
-  /home/vscode/.vscode-server/extensions/openai.chatgpt-.../bin/linux-.../codex
-
-Ein Eintrag im VS-Code-Downloadcache reicht nicht aus.
-
-Bitte VS Code direkt im Dev Container geöffnet lassen, bis die
-OpenAI-Erweiterung vollständig installiert wurde. Danach Setup erneut starten.
-"@
+if ($useCodex) {
+    Write-Host "OpenAI/Codex ist im Dev Container vollständig installiert." -ForegroundColor Green
+    if ($assistantStatus.Codex.Detail) {
+        Write-Host "Erkannt über:"
+        $assistantStatus.Codex.Detail -split "`r?`n" | ForEach-Object { Write-Host "  $_" }
+    }
+}
+if ($useClaude) {
+    Write-Host "Claude Code ist im Dev Container vollständig installiert." -ForegroundColor Green
+    if ($assistantStatus.Claude.Detail) {
+        Write-Host "Erkannt über:"
+        $assistantStatus.Claude.Detail -split "`r?`n" | ForEach-Object { Write-Host "  $_" }
     }
 }
 
-Write-Host "OpenAI/Codex-Binary ist im Dev Container vollständig installiert." -ForegroundColor Green
-if ($openaiResult.Detail) {
-    Write-Host "Erkannt über:"
-    $openaiResult.Detail -split "`r?`n" | ForEach-Object {
-        Write-Host "  $_"
-    }
-}
-
-if (-not $importChats) {
+if ($useCodex -and -not $importChats) {
     Step "Codex-Datenbank vorab initialisieren"
     Write-Host "Kein Chatimport angefordert."
     Write-Host "Eine Codex-Datenbank wird deshalb jetzt noch NICHT künstlich erzeugt."
@@ -4799,14 +5132,20 @@ Write-Host "  2. Nur die benötigten Projektordner per + oder Drag&Drop einbinde
 Write-Host "  3. Gewünschten Target-Namen unter /workspaces vergeben."
 Write-Host "     Leerzeichen sind erlaubt."
 Write-Host "  4. Falls Mounts geändert wurden: Container über Codex Mount Manager neu erstellen."
-Write-Host "  5. Danach Codex öffnen und anmelden."
+if ($useCodex -and $useClaude) {
+    Write-Host "  5. Danach Codex und Claude Code öffnen und jeweils anmelden."
+} elseif ($useClaude) {
+    Write-Host "  5. Danach Claude Code öffnen und anmelden."
+} else {
+    Write-Host "  5. Danach Codex öffnen und anmelden."
+}
 
 Write-Host ""
 Write-Host "========================================" -ForegroundColor Green
 Write-Host " SETUP ERFOLGREICH ABGESCHLOSSEN" -ForegroundColor Green
 Write-Host "========================================" -ForegroundColor Green
 Write-Host ""
-Write-Host "Codex-Dev-Container, Erweiterungen, Chatimport und Sandbox-Prüfung"
+Write-Host "Dev-Container, ausgewählte KI-Assistenten, Persistenz und Sandbox-Prüfung"
 Write-Host "wurden ohne Fehler abgeschlossen."
 
 if ($vsCodeDirect) {

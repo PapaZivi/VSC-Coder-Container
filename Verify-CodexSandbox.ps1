@@ -116,7 +116,7 @@ function Get-SecurityContext {
         $subtree += [pscustomobject]@{ Path=(Join-Path $systemDrive 'Documents and Settings'); Reason='Documents and Settings' }
     }
     if ($userProfile) {
-        foreach ($name in @('AppData','.ssh','.gnupg','.aws','.azure','.kube','.docker','.codex','.vscode','.config')) {
+        foreach ($name in @('AppData','.ssh','.gnupg','.aws','.azure','.kube','.docker','.codex','.claude','.claude.json','.vscode','.config')) {
             $subtree += [pscustomobject]@{ Path=(Join-Path $userProfile $name); Reason="sensibles Benutzerverzeichnis $name" }
         }
     }

@@ -1,7 +1,26 @@
-﻿# Fresh Codex Dev-Container Setup 1.0.51
+# Fresh Codex + Claude Dev-Container Setup 2.0
 
-Komplett neuer Aufbau einer isolierten VS-Code-/Codex-Umgebung. Es wird keine
+Komplett neuer Aufbau einer isolierten VS-Code-/KI-Dev-Container-Umgebung. Es wird keine
 Konfiguration eines anderen Rechners benötigt.
+
+## Neu in 2.0: Codex und Claude Code
+
+Das Setup erkennt vor den Assistenten-Rückfragen, ob **OpenAI/Codex** und/oder **Claude Code** bereits verwendet werden. Als Signale dienen die vorhandene `devcontainer.json`, installierte VS-Code-Erweiterungen, ein vorhandener Dev Container, lokale Benutzerzustände (`.codex`, `.claude`/`.claude.json`) sowie die konfigurierte bzw. bereits laufende Arbeits-WSL.
+
+Die Auswahl folgt dieser Logik:
+
+- nur Codex erkannt → fragt, ob Claude Code zusätzlich eingerichtet werden soll;
+- nur Claude Code erkannt → fragt, ob Codex zusätzlich eingerichtet werden soll;
+- beide erkannt → beide werden beibehalten;
+- nichts erkannt → Auswahl zwischen Codex, Claude Code oder beiden.
+
+Für Codex wird `openai.chatgpt`, für Claude Code `anthropic.claude-code` in der Dev-Container-Konfiguration eingetragen. Beide Erweiterungen liegen im gemeinsamen persistenten VS-Code-Extensions-Volume. Claude Code erhält zusätzlich das Volume `<prefix>-claude-home` unter `/home/vscode/.claude`; `CLAUDE_CONFIG_DIR=/home/vscode/.claude` sorgt dafür, dass Konfiguration, Sitzungen und Zugangsdaten einen Rebuild überleben. Eine bestehende lokale Claude-Historie wird in 2.0 bewusst **nicht automatisch kopiert**.
+
+Claude Code wird über die offizielle VS-Code-Erweiterung eingerichtet. Deren Chat-Oberfläche bringt ihre eigene interne CLI mit; ein zusätzliches systemweites `claude` im Terminal-PATH wird von diesem Setup nicht installiert. Eine bereits vorhandene Standalone-CLI wird jedoch bei der Erkennung berücksichtigt.
+
+Die Mount-Sicherheitsprüfung blockiert zusätzlich `.claude` und `.claude.json` als Projekt-Mounts. Enthalten ist **Codex Mount Manager 0.3.9**.
+
+
 
 ## Empfohlener Start mit komplettem Logfile
 
@@ -44,8 +63,8 @@ Installiert bzw. prüft:
 - WSL2
 - Ubuntu 24.04
 - Dev Containers
-- OpenAI/Codex
-- Codex Mount Manager
+- je nach Erkennung/Auswahl OpenAI/Codex, Claude Code oder beide
+- Codex Mount Manager 0.3.9
 
 Fehlende normale Anwendungen werden soweit möglich mit `winget` installiert.
 
@@ -61,12 +80,14 @@ Persistente Docker-Volumes:
 
 ```text
 codex-sandbox-workspaces
-codex-sandbox-home
+codex-sandbox-home                 # nur bei Codex
+codex-sandbox-claude-home          # nur bei Claude Code
 codex-sandbox-vscode-extensions
 ```
 
-`/home/vscode/.codex` wird dem Benutzer `vscode` zugeordnet, damit der früher
-aufgetretene EACCES-Fehler nicht wieder entsteht.
+`/home/vscode/.codex` und `/home/vscode/.claude` werden – sofern der jeweilige
+Assistent ausgewählt ist – dem Benutzer `vscode` zugeordnet. Für Claude Code setzt
+die Konfiguration zusätzlich `CLAUDE_CONFIG_DIR=/home/vscode/.claude`.
 
 Zusätzlich liegt `/home/vscode/.vscode-server/extensions` auf dem persistenten
 Volume `codex-sandbox-vscode-extensions`. Dadurch bleiben auch Erweiterungen,
