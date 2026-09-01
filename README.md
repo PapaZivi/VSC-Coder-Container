@@ -18,7 +18,7 @@ Für Codex wird `openai.chatgpt`, für Claude Code `anthropic.claude-code` in de
 
 Claude Code wird über die offizielle VS-Code-Erweiterung eingerichtet. Deren Chat-Oberfläche bringt ihre eigene interne CLI mit; ein zusätzliches systemweites `claude` im Terminal-PATH wird von diesem Setup nicht installiert. Eine bereits vorhandene Standalone-CLI wird jedoch bei der Erkennung berücksichtigt.
 
-Die Mount-Sicherheitsprüfung blockiert zusätzlich `.claude` und `.claude.json` als Projekt-Mounts. Enthalten ist **Codex Mount Manager 0.3.9**.
+Die Mount-Sicherheitsprüfung blockiert zusätzlich `.claude` und `.claude.json` als Projekt-Mounts. Enthalten ist **Codex Mount Manager 1.0.0**.
 
 
 
@@ -64,7 +64,7 @@ Installiert bzw. prüft:
 - Ubuntu 24.04
 - Dev Containers
 - je nach Erkennung/Auswahl OpenAI/Codex, Claude Code oder beide
-- Codex Mount Manager 0.3.9
+- Codex Mount Manager 1.0.0
 
 Fehlende normale Anwendungen werden soweit möglich mit `winget` installiert.
 

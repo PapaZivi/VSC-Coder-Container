@@ -4144,9 +4144,9 @@ Ensure-VsCodeMarketplaceExtension "ms-vscode-remote.remote-containers" "Dev Cont
 if ($useCodex) { Ensure-VsCodeMarketplaceExtension "openai.chatgpt" "OpenAI/Codex" }
 if ($useClaude) { Ensure-VsCodeMarketplaceExtension "anthropic.claude-code" "Claude Code" }
 
-$mountVsix = Join-Path $PSScriptRoot "tools\codex-mount-manager-0.3.9.vsix"
+$mountVsix = Join-Path $PSScriptRoot "tools\codex-mount-manager.vsix"
 $mountManagerId = "zivi-local.codex-mount-manager"
-$mountManagerVersion = "0.3.9"
+$mountManagerVersion = "1.0.0"
 Write-AtcCheckpoint ("Codex Mount Manager VSIX pruefen: {0}" -f $mountVsix)
 
 if ($installedVsCodeExtensions.ContainsKey($mountManagerId) -and $installedVsCodeExtensions[$mountManagerId] -eq $mountManagerVersion) {
@@ -4161,7 +4161,7 @@ elseif (Test-Path -LiteralPath $mountVsix) {
         Write-AtcCheckpoint ("Codex Mount Manager VSIX Hash nicht lesbar: {0}" -f $_.Exception.Message)
     }
 
-    Write-AtcCheckpoint "BEFORE code --install-extension <codex-mount-manager-0.3.9.vsix> --force"
+    Write-AtcCheckpoint "BEFORE code --install-extension <codex-mount-manager.vsix> --force"
     & $code --install-extension $mountVsix --force
     $mountManagerExit = $LASTEXITCODE
     Write-AtcCheckpoint ("AFTER Codex Mount Manager ExitCode={0}" -f $mountManagerExit)
