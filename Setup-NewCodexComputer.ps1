@@ -9,7 +9,7 @@ $ErrorActionPreference = "Stop"
 $script:TranscriptStarted = $false
 $script:LogPath = $null
 $script:AtcDiagPath = $null
-$script:SetupVersion = "1.0.51"
+$script:SetupVersion = "1.0.1"
 $script:ChatImportHelperSha256 = "9099F2671970CA0ACF29AF6DE0964F287767420C880FA8D84B7F4DA6FA5388C5"
 
 function Initialize-AtcDiagnosticLog {
@@ -1060,6 +1060,50 @@ function Get-Code {
     throw "VS-Code-CLI wurde nicht gefunden."
 }
 
+function Get-InstalledVsCodeExtensionVersions {
+    $result = @{}
+    $roots = @()
+
+    if (-not [string]::IsNullOrWhiteSpace($env:VSCODE_EXTENSIONS)) {
+        $roots += $env:VSCODE_EXTENSIONS
+    }
+    $roots += (Join-Path $env:USERPROFILE ".vscode\extensions")
+
+    foreach ($extensionRoot in ($roots | Select-Object -Unique)) {
+        if (-not (Test-Path -LiteralPath $extensionRoot -PathType Container)) { continue }
+
+        foreach ($dir in @(Get-ChildItem -LiteralPath $extensionRoot -Directory -ErrorAction SilentlyContinue)) {
+            $packageJson = Join-Path $dir.FullName "package.json"
+            if (-not (Test-Path -LiteralPath $packageJson -PathType Leaf)) { continue }
+
+            try {
+                $pkg = ([System.IO.File]::ReadAllText($packageJson, [System.Text.Encoding]::UTF8) | ConvertFrom-Json)
+                if (-not $pkg.publisher -or -not $pkg.name) { continue }
+
+                $id = (("{0}.{1}" -f $pkg.publisher, $pkg.name).ToLowerInvariant())
+                $version = if ($pkg.version) { [string]$pkg.version } else { "" }
+
+                if (-not $result.ContainsKey($id)) {
+                    $result[$id] = $version
+                }
+                else {
+                    try {
+                        if ([version]$version -gt [version]($result[$id])) { $result[$id] = $version }
+                    }
+                    catch {
+                        if ($version -gt $result[$id]) { $result[$id] = $version }
+                    }
+                }
+            }
+            catch {
+                # Eine defekte/teilweise Extension darf die Bestandsaufnahme nicht blockieren.
+            }
+        }
+    }
+
+    return $result
+}
+
 function Get-Docker {
     $c = Get-Command docker.exe -ErrorAction SilentlyContinue
     if ($c) { return $c.Source }
@@ -1163,8 +1207,15 @@ function Start-DockerDesktopAndWait([string]$Docker, [string]$DockerDesktopExe) 
         throw "Docker Desktop.exe wurde nicht gefunden: $DockerDesktopExe"
     }
 
-    Write-Host "Docker Desktop wird gestartet..."
-    Start-Process -FilePath $DockerDesktopExe -ErrorAction Stop | Out-Null
+    # ATC-Hotfix 1.0.1: Docker Desktop bewusst NICHT aus PowerShell starten.
+    # Bei einer ATC-Remediation können neben dem Setup auch beteiligte
+    # Docker-Desktop-Datendateien quarantänisiert werden. Ein manueller Start
+    # trennt den langlebigen Docker-Desktop-Prozess vom PowerShell-Prozessbaum.
+    Write-AtcCheckpoint "Docker Engine nicht bereit; manueller Docker-Desktop-Start erforderlich"
+    Write-Host "Docker Desktop läuft noch nicht." -ForegroundColor Yellow
+    Write-Host "ATC-Mitigation: Docker Desktop bitte jetzt MANUELL starten." -ForegroundColor Yellow
+    Write-Host "Das Setup startet Docker Desktop absichtlich nicht mehr als PowerShell-Kindprozess."
+    [void](Read-Host "Wenn Docker Desktop gestartet ist, ENTER drücken")
 
     Write-Host "Warte auf Docker Engine..."
     if (-not (Wait-DockerReady $Docker 300)) {
@@ -1173,6 +1224,7 @@ function Start-DockerDesktopAndWait([string]$Docker, [string]$DockerDesktopExe) 
         return $false
     }
 
+    Write-AtcCheckpoint "Docker Engine nach manuellem Start bereit"
     Write-Host "Docker Engine läuft."
     return $true
 }
@@ -3666,7 +3718,7 @@ Write-Host "Dev-Containers-WSL: $UbuntuDistro"
 Write-Host ""
 Write-Host "Bind-Mounts werden dadurch auf allen Rechnern aus Sicht von WSL"
 Write-Host "(z.B. /mnt/c/..., /mnt/d/..., /mnt/e/..., /mnt/y/...) gespeichert."
-Step "Docker Desktop starten"
+Step "Docker Desktop sicherstellen"
 
 $docker = Get-Docker
 $dockerDesktop = "$env:ProgramFiles\Docker\Docker\Docker Desktop.exe"
@@ -3675,7 +3727,7 @@ Write-Host "Docker CLI: $docker"
 
 if (-not (Test-DockerReady $docker)) {
     if (-not (Start-DockerDesktopAndWait $docker $dockerDesktop)) {
-        throw "Docker Desktop konnte nicht gestartet werden."
+        throw "Docker Desktop wurde nicht bereit."
     }
 } else {
     Write-Host "Docker Engine läuft bereits."
@@ -3779,33 +3831,16 @@ $code = Get-Code
 Write-Host "VS-Code-CLI: $code"
 Write-AtcCheckpoint ("VS-Code-CLI aufgeloest: {0}" -f $code)
 
-# Wiederholte Setup-Laeufe sollen moeglichst wenig am System veraendern.
-# Deshalb zuerst einmal den Ist-Zustand lesen und bereits vorhandene
-# Erweiterungen nicht mehr mit --force neu installieren.
-$installedVsCodeExtensions = @{}
-Write-AtcCheckpoint "BEFORE code --list-extensions --show-versions"
-$extensionList = @(& $code --list-extensions --show-versions 2>$null)
-$extensionListExit = $LASTEXITCODE
-Write-AtcCheckpoint ("AFTER code --list-extensions ExitCode={0}" -f $extensionListExit)
+# ATC-Hotfix: Den Ist-Zustand direkt aus den installierten Extension-Verzeichnissen
+# lesen. Dadurch entfaellt ein kompletter code.cmd-Prozess nur fuer
+# --list-extensions. Falls mehrere Erweiterungen fehlen, werden sie in EINEM
+# einzigen CLI-Aufruf installiert.
+$installedVsCodeExtensions = Get-InstalledVsCodeExtensionVersions
+Write-AtcCheckpoint ("VS-Code-Extensions ohne CLI ermittelt: {0}" -f $installedVsCodeExtensions.Count)
 
-if ($extensionListExit -eq 0) {
-    foreach ($line in $extensionList) {
-        $entry = ([string]$line).Trim()
-        if (-not $entry) { continue }
-        $at = $entry.LastIndexOf('@')
-        if ($at -gt 0) {
-            $id = $entry.Substring(0, $at).ToLowerInvariant()
-            $version = $entry.Substring($at + 1)
-            $installedVsCodeExtensions[$id] = $version
-        } else {
-            $installedVsCodeExtensions[$entry.ToLowerInvariant()] = ""
-        }
-    }
-} else {
-    Write-Warning "Installierte VS-Code-Erweiterungen konnten nicht aufgelistet werden; erforderliche Erweiterungen werden normal installiert."
-}
+$pendingExtensionInstalls = New-Object System.Collections.ArrayList
 
-function Ensure-VsCodeMarketplaceExtension([string]$Id, [string]$Label) {
+function Queue-VsCodeMarketplaceExtension([string]$Id, [string]$Label) {
     $key = $Id.ToLowerInvariant()
     if ($installedVsCodeExtensions.ContainsKey($key)) {
         Write-Host "$Label ist bereits installiert; keine erneute Installation erforderlich." -ForegroundColor Green
@@ -3813,15 +3848,16 @@ function Ensure-VsCodeMarketplaceExtension([string]$Id, [string]$Label) {
         return
     }
 
-    Write-AtcCheckpoint ("BEFORE code --install-extension {0}" -f $Id)
-    & $code --install-extension $Id
-    $rc = $LASTEXITCODE
-    Write-AtcCheckpoint ("AFTER {0} ExitCode={1}" -f $Id, $rc)
-    if ($rc -ne 0) { throw "$Label konnte nicht installiert werden." }
+    [void]$pendingExtensionInstalls.Add([pscustomobject]@{
+        Argument = $Id
+        Label = $Label
+        Id = $key
+        ExpectedVersion = ""
+    })
 }
 
-Ensure-VsCodeMarketplaceExtension "ms-vscode-remote.remote-containers" "Dev Containers"
-Ensure-VsCodeMarketplaceExtension "openai.chatgpt" "OpenAI/Codex"
+Queue-VsCodeMarketplaceExtension "ms-vscode-remote.remote-containers" "Dev Containers"
+Queue-VsCodeMarketplaceExtension "openai.chatgpt" "OpenAI/Codex"
 
 $mountVsix = Join-Path $PSScriptRoot "tools\codex-mount-manager-0.3.8.vsix"
 $mountManagerId = "zivi-local.codex-mount-manager"
@@ -3840,14 +3876,48 @@ elseif (Test-Path -LiteralPath $mountVsix) {
         Write-AtcCheckpoint ("Codex Mount Manager VSIX Hash nicht lesbar: {0}" -f $_.Exception.Message)
     }
 
-    Write-AtcCheckpoint "BEFORE code --install-extension <codex-mount-manager-0.3.8.vsix> --force"
-    & $code --install-extension $mountVsix --force
-    $mountManagerExit = $LASTEXITCODE
-    Write-AtcCheckpoint ("AFTER Codex Mount Manager ExitCode={0}" -f $mountManagerExit)
-    if ($mountManagerExit -ne 0) { throw "Codex Mount Manager konnte nicht installiert werden." }
-} else {
+    [void]$pendingExtensionInstalls.Add([pscustomobject]@{
+        Argument = $mountVsix
+        Label = "Codex Mount Manager"
+        Id = $mountManagerId
+        ExpectedVersion = $mountManagerVersion
+    })
+}
+else {
     Write-AtcCheckpoint "Codex Mount Manager VSIX fehlt; Installationsaufruf wird uebersprungen"
     Write-Warning "Codex Mount Manager VSIX fehlt: $mountVsix"
+}
+
+if ($pendingExtensionInstalls.Count -gt 0) {
+    $installArgs = @()
+    foreach ($item in $pendingExtensionInstalls) {
+        $installArgs += "--install-extension"
+        $installArgs += [string]$item.Argument
+    }
+    $installArgs += "--force"
+
+    Write-AtcCheckpoint ("BEFORE gebuendelter code --install-extension Aufruf Count={0}" -f $pendingExtensionInstalls.Count)
+    & $code @installArgs
+    $extensionInstallExit = $LASTEXITCODE
+    Write-AtcCheckpoint ("AFTER gebuendelter code --install-extension Aufruf ExitCode={0}" -f $extensionInstallExit)
+
+    if ($extensionInstallExit -ne 0) {
+        throw "Mindestens eine erforderliche VS-Code-Erweiterung konnte nicht installiert werden."
+    }
+
+    $installedVsCodeExtensions = Get-InstalledVsCodeExtensionVersions
+    foreach ($item in $pendingExtensionInstalls) {
+        if (-not $installedVsCodeExtensions.ContainsKey($item.Id)) {
+            throw ("{0} wurde nach dem VS-Code-CLI-Aufruf nicht als installiert erkannt." -f $item.Label)
+        }
+        if ($item.ExpectedVersion -and $installedVsCodeExtensions[$item.Id] -ne $item.ExpectedVersion) {
+            throw ("{0}: erwartet Version {1}, gefunden {2}." -f $item.Label, $item.ExpectedVersion, $installedVsCodeExtensions[$item.Id])
+        }
+        Write-Host ("{0} ist installiert (Version {1})." -f $item.Label, $installedVsCodeExtensions[$item.Id]) -ForegroundColor Green
+    }
+}
+else {
+    Write-AtcCheckpoint "SKIP VS-Code-CLI Extension-Installation; alles bereits vorhanden"
 }
 
 Write-AtcCheckpoint "END Abschnitt VS-Code-Erweiterungen installieren"
@@ -4483,7 +4553,7 @@ if ($needsVsCodeBootstrap) {
 
     Write-Host @"
 
-VS Code wird jetzt geöffnet.
+VS Code muss jetzt geöffnet werden.
 Grund: $bootstrapReason
 
 1. Strg+Shift+P
@@ -4510,9 +4580,12 @@ damit Dev Containers den Container nicht durch shutdownAction stoppt.
 
 "@
 
-    & $code -n $InstallDirectory
-
+    Write-AtcCheckpoint "WAITING manueller VS-Code-/Dev-Container-Bootstrap"
+    Write-Host "ATC-Mitigation: VS Code bitte MANUELL öffnen." -ForegroundColor Yellow
+    Write-Host "Workspace: $InstallDirectory"
+    Write-Host "Danach wie oben beschrieben 'Dev Containers: Reopen in Container' ausführen."
     Read-Host "Wenn der Dev Container vollständig geöffnet ist, VS Code GEÖFFNET LASSEN und hier ENTER drücken"
+    Write-AtcCheckpoint "AFTER manueller VS-Code-/Dev-Container-Bootstrap"
     Write-Host "VS-Code-/Dev-Container-Aufbau wurde vom Benutzer bestätigt."
 
     Write-Host "Suche den erzeugten Dev Container..."
@@ -4790,7 +4863,10 @@ Write-Host ""
 Write-Host "Das technische Setup ist abgeschlossen." -ForegroundColor Green
 Write-Host ""
 
-$vsCodeDirect = Open-VsCodeInDevContainer $code $InstallDirectory "/workspaces"
+Write-AtcCheckpoint "SKIP automatischer finaler VS-Code-Start; ATC-Mitigation aktiv"
+$vsCodeDirect = $false
+Write-Host "ATC-Mitigation: VS Code wird am Ende nicht aus PowerShell gestartet." -ForegroundColor Yellow
+Write-Host "Falls es nicht mehr offen ist, VS Code bitte manuell mit dem Codex-Workspace öffnen."
 
 Write-Host ""
 Write-Host "In VS Code anschließend:"
@@ -4809,11 +4885,7 @@ Write-Host ""
 Write-Host "Codex-Dev-Container, Erweiterungen, Chatimport und Sandbox-Prüfung"
 Write-Host "wurden ohne Fehler abgeschlossen."
 
-if ($vsCodeDirect) {
-    Write-Host "VS Code wurde direkt für den Dev Container gestartet." -ForegroundColor Green
-} else {
-    Write-Host "VS Code wurde als Fallback mit dem lokalen Workspace geöffnet." -ForegroundColor Yellow
-}
+Write-Host "VS Code wurde aus ATC-Gründen nicht automatisch gestartet." -ForegroundColor Yellow
 
 if ($script:LogPath) {
     Write-Host ""

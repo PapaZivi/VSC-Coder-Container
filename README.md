@@ -1,4 +1,4 @@
-﻿# Fresh Codex Dev-Container Setup 1.0.51
+﻿# VSC Coder Container 1.0.1
 
 Komplett neuer Aufbau einer isolierten VS-Code-/Codex-Umgebung. Es wird keine
 Konfiguration eines anderen Rechners benötigt.
@@ -29,6 +29,10 @@ Direkter Start der PS1 ist ebenfalls möglich:
 ```powershell
 .\Setup-NewCodexComputer.ps1 -LogFile
 ```
+
+Für den ATC-Hotfix ist der Start über `Setup-NewCodexComputer.cmd` empfohlen.
+Der CMD-Launcher verwendet `Run-Setup.ps1`, sodass Syntax-/Integritätsprüfung und
+das eigentliche Setup nicht mehr in zwei getrennten PowerShell-Prozessen laufen.
 
 Hinweis: In Windows PowerShell hat `--` eine besondere Bedeutung. Deshalb wird
 für die gewünschte Schreibweise `--logfile` der mitgelieferte CMD-Launcher
@@ -247,11 +251,21 @@ Zusätzlich wird die `devcontainer.json` auf kritische Bind-Mount-Quellen geprü
 
 # Versionsenticklung
 
+## Neu in 1.0.1
+
+- Reiner Bitdefender-/ATC-Hotfix auf Basis des stabilen v1-Zweigs. Keine Claude-Code-/v2-Funktionen enthalten.
+- Der CMD-Launcher startet nicht mehr erst einen separaten Syntaxcheck-Prozess und danach das Setup. `Run-Setup.ps1` prüft Syntax und Chatimport-Helper und führt das eigentliche Setup anschließend im selben PowerShell-Prozess aus.
+- Docker Desktop wird nicht mehr automatisch aus PowerShell gestartet. Wenn die Engine noch nicht läuft, fordert das Setup zu einem manuellen Start auf. Dadurch hängt der langlebige Docker-Desktop-Prozess nicht mehr am PowerShell-Prozessbaum.
+- VS Code wird für Bootstrap und Abschluss nicht mehr automatisch als GUI-Kindprozess des Setups gestartet. Das Setup fordert stattdessen zum manuellen Öffnen auf.
+- Installierte VS-Code-Erweiterungen werden direkt aus den Extension-Verzeichnissen gelesen. Der bisherige zusätzliche `code --list-extensions --show-versions`-Prozess entfällt.
+- Fehlende Erweiterungen werden in einem einzigen gebündelten `code --install-extension`-Aufruf installiert. Bereits vorhandene Erweiterungen verursachen überhaupt keinen VS-Code-CLI-Aufruf.
+- Zusätzliche ATC-Checkpoints markieren den manuellen Docker-/VS-Code-Bootstrap und die gebündelte Extension-Installation.
+- Der bereits in v1 vorhandene isolierte Chatimport bleibt unverändert: keine zweite Windows-PowerShell, kein Docker-Socket, kein Netzwerk und inkrementeller Import.
 
 
 ## Neu in 1.0.51
 
-- Der Chatimport startet **keine zweite Windows-PowerShell** mehr. Damit entfällt die bisherige `powershell.exe -ExecutionPolicy Bypass -File Import-ExistingCodexChats.ps1`-Verhaltenskette, die auf HAI129 reproduzierbar Bitdefender Advanced Threat Control ausgelöst hat.
+- Der Chatimport startet **keine zweite Windows-PowerShell** mehr. Damit entfällt die bisherige `powershell.exe -ExecutionPolicy Bypass -File Import-ExistingCodexChats.ps1`-Verhaltenskette, die reproduzierbar Bitdefender Advanced Threat Control ausgelöst hat.
 - Große `docker cp`-Transfers für Datenbank, Sessions, Attachments und ein zur Laufzeit erzeugtes `merge.py` entfallen. Der Import läuft stattdessen in einem kurzlebigen, isolierten Helper-Container.
 - Der Helper sieht ausschließlich die lokale `.codex`-Quelle read-only und das persistente `.codex`-Zielvolume, läuft als `vscode`, hat `--network none`, keinen Docker-Socket, `--cap-drop ALL`, `no-new-privileges` und ein read-only Root-Dateisystem mit separatem `/tmp`.
 - Der Python-Helper liegt statisch unter `tools/Import-CodexChatsHelper.py` und wird vor Verwendung gegen eine im Setup fest hinterlegte SHA-256-Prüfsumme geprüft.
@@ -312,7 +326,7 @@ solche Laufwerke explizit als Projektquellen eingebunden sein koennen.
 
 ## Neu in 1.0.43
 
-Bitdefender Advanced Threat Control beendete den Setup-Prozess auf HAI129
+Bitdefender Advanced Threat Control beendete den Setup-Prozess
 reproduzierbar unmittelbar beim Beginn der TAR-basierten Extension-Migration aus
 1.0.42. Die Migration verwendet deshalb wieder ein kurzlebiges lokales
 `docker commit`-Image, schreibt aber kein TAR-Archiv mehr auf den Windows-Host.
@@ -530,8 +544,8 @@ bind source path does not exist: /run/desktop/mnt/host/uC/<server>/<share>
 
 Das Setup setzt `dev.containers.executeInWSL = true` jetzt **korrekt auf
 VS-Code-Benutzerebene** und pinnt `dev.containers.executeInWSLDistro` auf die
-vorher ausgewählte WSL. Damit ist das Verhalten auf NOTEHAI09, HAI100 und
-weiteren Rechnern identisch.
+vorher ausgewählte WSL. Damit ist das Verhalten auf unterschiedlichen
+Rechnern identisch.
 
 Windows-Laufwerke werden wieder als `/mnt/<laufwerk>/...` verwendet. Gemappte
 Netzlaufwerke werden wie bisher vom Setup per `drvfs` in dieser WSL bereitgestellt.
@@ -562,14 +576,14 @@ Workspace-Einstellung gesetzt, sondern auf **VS-Code-Benutzerebene** explizit
 auf `false` gestellt. Ein alter globaler `dev.containers.executeInWSLDistro`-Wert
 wird entfernt.
 
-Damit läuft die Dev-Containers-CLI auf NOTEHAI09, HAI100 und weiteren Rechnern
+Damit läuft die Dev-Containers-CLI konsistent auf unterschiedlichen Rechnern
 gleich unter Windows; Docker Desktop kann intern weiterhin WSL2 verwenden.
 Bind-Mounts verwenden deshalb überall echte Windows-Hostpfade wie `C:\\...`,
 `O:\\` oder `V:\\html`. Der Mount Manager migriert alte `/mnt/<laufwerk>/...`-
 Quellen automatisch.
 
-Dies behebt den Widerspruch, bei dem NOTEHAI09 mit `/mnt/c/...` scheiterte, während
-HAI100 mit `C:\\...` scheiterte: Ursache war die unterschiedlich gestartete
+Dies behebt den Widerspruch zwischen `/mnt/c/...`- und `C:\\...`-Pfaden:
+Ursache war die unterschiedlich gestartete
 Dev-Containers-CLI, nicht Ubuntu oder Docker Desktop selbst.
 
 ## Neu in 1.0.32
