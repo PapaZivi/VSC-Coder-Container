@@ -117,6 +117,30 @@ function Step([string]$Text) {
     Write-Host "==> $Text" -ForegroundColor Cyan
 }
 
+function Get-SetupTempDirectory {
+    $dir = Join-Path $PSScriptRoot "logs\temp"
+    [System.IO.Directory]::CreateDirectory($dir) | Out-Null
+    return $dir
+}
+
+function New-SetupTempPath([string]$Prefix, [string]$Extension = ".tmp") {
+    $dir = Get-SetupTempDirectory
+    return Join-Path $dir ($Prefix + "-" + [guid]::NewGuid().ToString("N") + $Extension)
+}
+
+function Remove-SetupTempFile([string]$Path) {
+    if ([string]::IsNullOrWhiteSpace($Path)) { return }
+
+    try {
+        if ([System.IO.File]::Exists($Path)) {
+            [System.IO.File]::Delete($Path)
+        }
+    }
+    catch {
+        Write-Verbose "Temporäre Datei konnte nicht entfernt werden: $Path"
+    }
+}
+
 function Ask-YesNo([string]$Question, [bool]$DefaultYes = $true) {
     $suffix = if ($DefaultYes) { "[J/n]" } else { "[j/N]" }
     $answer = Read-Host "$Question $suffix"
@@ -494,8 +518,8 @@ function Invoke-Probe {
         [string[]]$Arguments = @()
     )
 
-    $outFile = [IO.Path]::GetTempFileName()
-    $errFile = [IO.Path]::GetTempFileName()
+    $outFile = New-SetupTempPath "probe-out" ".txt"
+    $errFile = New-SetupTempPath "probe-err" ".txt"
 
     try {
         $argLine = ($Arguments | ForEach-Object { Quote-Argument ([string]$_) }) -join " "
@@ -538,7 +562,8 @@ function Invoke-Probe {
         }
     }
     finally {
-        Remove-Item -LiteralPath $outFile,$errFile -Force -ErrorAction SilentlyContinue
+        Remove-SetupTempFile $outFile
+        Remove-SetupTempFile $errFile
     }
 }
 
@@ -1233,6 +1258,50 @@ function Get-Code {
     throw "VS-Code-CLI wurde nicht gefunden."
 }
 
+function Get-InstalledVsCodeExtensionVersions {
+    $result = @{}
+    $roots = @()
+
+    if (-not [string]::IsNullOrWhiteSpace($env:VSCODE_EXTENSIONS)) {
+        $roots += $env:VSCODE_EXTENSIONS
+    }
+    $roots += (Join-Path $env:USERPROFILE ".vscode\extensions")
+
+    foreach ($extensionRoot in ($roots | Select-Object -Unique)) {
+        if (-not (Test-Path -LiteralPath $extensionRoot -PathType Container)) { continue }
+
+        foreach ($dir in @(Get-ChildItem -LiteralPath $extensionRoot -Directory -ErrorAction SilentlyContinue)) {
+            $packageJson = Join-Path $dir.FullName "package.json"
+            if (-not (Test-Path -LiteralPath $packageJson -PathType Leaf)) { continue }
+
+            try {
+                $pkg = ([System.IO.File]::ReadAllText($packageJson, [System.Text.Encoding]::UTF8) | ConvertFrom-Json)
+                if (-not $pkg.publisher -or -not $pkg.name) { continue }
+
+                $id = (("{0}.{1}" -f $pkg.publisher, $pkg.name).ToLowerInvariant())
+                $version = if ($pkg.version) { [string]$pkg.version } else { "" }
+
+                if (-not $result.ContainsKey($id)) {
+                    $result[$id] = $version
+                }
+                else {
+                    try {
+                        if ([version]$version -gt [version]($result[$id])) { $result[$id] = $version }
+                    }
+                    catch {
+                        if ($version -gt $result[$id]) { $result[$id] = $version }
+                    }
+                }
+            }
+            catch {
+                # Eine defekte/teilweise Extension darf die Bestandsaufnahme nicht blockieren.
+            }
+        }
+    }
+
+    return $result
+}
+
 function Get-Docker {
     $c = Get-Command docker.exe -ErrorAction SilentlyContinue
     if ($c) { return $c.Source }
@@ -1336,8 +1405,13 @@ function Start-DockerDesktopAndWait([string]$Docker, [string]$DockerDesktopExe) 
         throw "Docker Desktop.exe wurde nicht gefunden: $DockerDesktopExe"
     }
 
-    Write-Host "Docker Desktop wird gestartet..."
-    Start-Process -FilePath $DockerDesktopExe -ErrorAction Stop | Out-Null
+    # ATC-Mitigation aus v1.0.1: Docker Desktop bewusst NICHT aus PowerShell starten.
+    # So hängt der langlebige Docker-Desktop-Prozess nicht am Setup-Prozessbaum.
+    Write-AtcCheckpoint "Docker Engine nicht bereit; manueller Docker-Desktop-Start erforderlich"
+    Write-Host "Docker Desktop läuft noch nicht." -ForegroundColor Yellow
+    Write-Host "ATC-Mitigation: Docker Desktop bitte jetzt MANUELL starten." -ForegroundColor Yellow
+    Write-Host "Das Setup startet Docker Desktop absichtlich nicht mehr als PowerShell-Kindprozess."
+    [void](Read-Host "Wenn Docker Desktop gestartet ist, ENTER drücken")
 
     Write-Host "Warte auf Docker Engine..."
     if (-not (Wait-DockerReady $Docker 300)) {
@@ -1346,6 +1420,7 @@ function Start-DockerDesktopAndWait([string]$Docker, [string]$DockerDesktopExe) 
         return $false
     }
 
+    Write-AtcCheckpoint "Docker Engine nach manuellem Start bereit"
     Write-Host "Docker Engine läuft."
     return $true
 }
@@ -1747,9 +1822,7 @@ function Invoke-ContainerShellScript(
     [string]$RunAsUser = "root",
     [string]$Purpose = "container-script"
 ) {
-    $localScript = Join-Path $env:TEMP (
-        "codex-" + $Purpose + "-" + [guid]::NewGuid().ToString("N") + ".sh"
-    )
+    $localScript = New-SetupTempPath ("codex-" + $Purpose) ".sh"
     $remoteScript = "/tmp/" + [IO.Path]::GetFileName($localScript)
 
     $normalized = ($ScriptText -replace "`r`n", "`n")
@@ -1841,7 +1914,7 @@ function Invoke-ContainerShellScript(
             Write-Verbose "Remote-Cleanup für '$Purpose' übersprungen: $($_.Exception.Message)"
         }
 
-        Remove-Item -LiteralPath $localScript -Force -ErrorAction SilentlyContinue
+        Remove-SetupTempFile $localScript
     }
 }
 
@@ -2508,7 +2581,7 @@ function Test-SourceCodexHistoryPresentInContainer(
         "{0}`t{1}" -f $relative, $file.Length
     }
 
-    $tempList = Join-Path $env:TEMP ("codex-preflight-rollouts-" + [guid]::NewGuid().ToString("N") + ".txt")
+    $tempList = New-SetupTempPath "codex-preflight-rollouts" ".txt"
     $remoteList = "/tmp/codex-preflight-rollouts.txt"
 
     try {
@@ -2592,7 +2665,7 @@ rm -f /tmp/codex-preflight-rollouts.txt
         }
 
         if ($sourceIndexIds.Count -gt 0) {
-            $targetIndexTemp = Join-Path $env:TEMP ("codex-preflight-target-index-" + [guid]::NewGuid().ToString("N") + ".jsonl")
+            $targetIndexTemp = New-SetupTempPath "codex-preflight-target-index" ".jsonl"
             try {
                 $indexCopy = Invoke-DockerNoThrow $Docker @(
                     "cp",
@@ -2624,7 +2697,7 @@ rm -f /tmp/codex-preflight-rollouts.txt
                 }
             }
             finally {
-                Remove-Item -LiteralPath $targetIndexTemp -Force -ErrorAction SilentlyContinue
+                Remove-SetupTempFile $targetIndexTemp
             }
         }
 
@@ -2651,7 +2724,7 @@ rm -f /tmp/codex-preflight-rollouts.txt
         }
     }
     finally {
-        Remove-Item -LiteralPath $tempList -Force -ErrorAction SilentlyContinue
+        Remove-SetupTempFile $tempList
         Invoke-DockerNoThrow $Docker @(
             "exec", "-u", "vscode", $ContainerId,
             "rm", "-f", $remoteList
@@ -3979,7 +4052,7 @@ Write-Host "Dev-Containers-WSL: $UbuntuDistro"
 Write-Host ""
 Write-Host "Bind-Mounts werden dadurch auf allen Rechnern aus Sicht von WSL"
 Write-Host "(z.B. /mnt/c/..., /mnt/d/..., /mnt/e/..., /mnt/y/...) gespeichert."
-Step "Docker Desktop starten"
+Step "Docker Desktop sicherstellen"
 
 $docker = Get-Docker
 $dockerDesktop = "$env:ProgramFiles\Docker\Docker\Docker Desktop.exe"
@@ -3988,7 +4061,7 @@ Write-Host "Docker CLI: $docker"
 
 if (-not (Test-DockerReady $docker)) {
     if (-not (Start-DockerDesktopAndWait $docker $dockerDesktop)) {
-        throw "Docker Desktop konnte nicht gestartet werden."
+        throw "Docker Desktop wurde nicht bereit."
     }
 } else {
     Write-Host "Docker Engine läuft bereits."
@@ -4099,33 +4172,16 @@ $code = Get-Code
 Write-Host "VS-Code-CLI: $code"
 Write-AtcCheckpoint ("VS-Code-CLI aufgeloest: {0}" -f $code)
 
-# Wiederholte Setup-Laeufe sollen moeglichst wenig am System veraendern.
-# Deshalb zuerst einmal den Ist-Zustand lesen und bereits vorhandene
-# Erweiterungen nicht mehr mit --force neu installieren.
-$installedVsCodeExtensions = @{}
-Write-AtcCheckpoint "BEFORE code --list-extensions --show-versions"
-$extensionList = @(& $code --list-extensions --show-versions 2>$null)
-$extensionListExit = $LASTEXITCODE
-Write-AtcCheckpoint ("AFTER code --list-extensions ExitCode={0}" -f $extensionListExit)
+# ATC-Mitigation aus v1.0.1: Den Ist-Zustand direkt aus den installierten
+# Extension-Verzeichnissen lesen. Dadurch entfaellt ein kompletter code.cmd-
+# Prozess nur fuer --list-extensions. Fehlende Erweiterungen werden gesammelt
+# und in EINEM einzigen VS-Code-CLI-Aufruf installiert.
+$installedVsCodeExtensions = Get-InstalledVsCodeExtensionVersions
+Write-AtcCheckpoint ("VS-Code-Extensions ohne CLI ermittelt: {0}" -f $installedVsCodeExtensions.Count)
 
-if ($extensionListExit -eq 0) {
-    foreach ($line in $extensionList) {
-        $entry = ([string]$line).Trim()
-        if (-not $entry) { continue }
-        $at = $entry.LastIndexOf('@')
-        if ($at -gt 0) {
-            $id = $entry.Substring(0, $at).ToLowerInvariant()
-            $version = $entry.Substring($at + 1)
-            $installedVsCodeExtensions[$id] = $version
-        } else {
-            $installedVsCodeExtensions[$entry.ToLowerInvariant()] = ""
-        }
-    }
-} else {
-    Write-Warning "Installierte VS-Code-Erweiterungen konnten nicht aufgelistet werden; erforderliche Erweiterungen werden normal installiert."
-}
+$pendingExtensionInstalls = New-Object System.Collections.ArrayList
 
-function Ensure-VsCodeMarketplaceExtension([string]$Id, [string]$Label) {
+function Queue-VsCodeMarketplaceExtension([string]$Id, [string]$Label) {
     $key = $Id.ToLowerInvariant()
     if ($installedVsCodeExtensions.ContainsKey($key)) {
         Write-Host "$Label ist bereits installiert; keine erneute Installation erforderlich." -ForegroundColor Green
@@ -4133,16 +4189,17 @@ function Ensure-VsCodeMarketplaceExtension([string]$Id, [string]$Label) {
         return
     }
 
-    Write-AtcCheckpoint ("BEFORE code --install-extension {0}" -f $Id)
-    & $code --install-extension $Id
-    $rc = $LASTEXITCODE
-    Write-AtcCheckpoint ("AFTER {0} ExitCode={1}" -f $Id, $rc)
-    if ($rc -ne 0) { throw "$Label konnte nicht installiert werden." }
+    [void]$pendingExtensionInstalls.Add([pscustomobject]@{
+        Argument = $Id
+        Label = $Label
+        Id = $key
+        ExpectedVersion = ""
+    })
 }
 
-Ensure-VsCodeMarketplaceExtension "ms-vscode-remote.remote-containers" "Dev Containers"
-if ($useCodex) { Ensure-VsCodeMarketplaceExtension "openai.chatgpt" "OpenAI/Codex" }
-if ($useClaude) { Ensure-VsCodeMarketplaceExtension "anthropic.claude-code" "Claude Code" }
+Queue-VsCodeMarketplaceExtension "ms-vscode-remote.remote-containers" "Dev Containers"
+if ($useCodex) { Queue-VsCodeMarketplaceExtension "openai.chatgpt" "OpenAI/Codex" }
+if ($useClaude) { Queue-VsCodeMarketplaceExtension "anthropic.claude-code" "Claude Code" }
 
 $mountVsix = Join-Path $PSScriptRoot "tools\codex-mount-manager.vsix"
 $mountManagerId = "zivi-local.codex-mount-manager"
@@ -4161,14 +4218,48 @@ elseif (Test-Path -LiteralPath $mountVsix) {
         Write-AtcCheckpoint ("Codex Mount Manager VSIX Hash nicht lesbar: {0}" -f $_.Exception.Message)
     }
 
-    Write-AtcCheckpoint "BEFORE code --install-extension <codex-mount-manager.vsix> --force"
-    & $code --install-extension $mountVsix --force
-    $mountManagerExit = $LASTEXITCODE
-    Write-AtcCheckpoint ("AFTER Codex Mount Manager ExitCode={0}" -f $mountManagerExit)
-    if ($mountManagerExit -ne 0) { throw "Codex Mount Manager konnte nicht installiert werden." }
-} else {
+    [void]$pendingExtensionInstalls.Add([pscustomobject]@{
+        Argument = $mountVsix
+        Label = "Codex Mount Manager"
+        Id = $mountManagerId
+        ExpectedVersion = $mountManagerVersion
+    })
+}
+else {
     Write-AtcCheckpoint "Codex Mount Manager VSIX fehlt; Installationsaufruf wird uebersprungen"
     Write-Warning "Codex Mount Manager VSIX fehlt: $mountVsix"
+}
+
+if ($pendingExtensionInstalls.Count -gt 0) {
+    $installArgs = @()
+    foreach ($item in $pendingExtensionInstalls) {
+        $installArgs += "--install-extension"
+        $installArgs += [string]$item.Argument
+    }
+    $installArgs += "--force"
+
+    Write-AtcCheckpoint ("BEFORE gebuendelter code --install-extension Aufruf Count={0}" -f $pendingExtensionInstalls.Count)
+    & $code @installArgs
+    $extensionInstallExit = $LASTEXITCODE
+    Write-AtcCheckpoint ("AFTER gebuendelter code --install-extension Aufruf ExitCode={0}" -f $extensionInstallExit)
+
+    if ($extensionInstallExit -ne 0) {
+        throw "Mindestens eine erforderliche VS-Code-Erweiterung konnte nicht installiert werden."
+    }
+
+    $installedVsCodeExtensions = Get-InstalledVsCodeExtensionVersions
+    foreach ($item in $pendingExtensionInstalls) {
+        if (-not $installedVsCodeExtensions.ContainsKey($item.Id)) {
+            throw ("{0} wurde nach dem VS-Code-CLI-Aufruf nicht als installiert erkannt." -f $item.Label)
+        }
+        if ($item.ExpectedVersion -and $installedVsCodeExtensions[$item.Id] -ne $item.ExpectedVersion) {
+            throw ("{0}: erwartet Version {1}, gefunden {2}." -f $item.Label, $item.ExpectedVersion, $installedVsCodeExtensions[$item.Id])
+        }
+        Write-Host ("{0} ist installiert (Version {1})." -f $item.Label, $installedVsCodeExtensions[$item.Id]) -ForegroundColor Green
+    }
+}
+else {
+    Write-AtcCheckpoint "SKIP VS-Code-CLI Extension-Installation; alles bereits vorhanden"
 }
 
 Write-AtcCheckpoint "END Abschnitt VS-Code-Erweiterungen installieren"
@@ -4196,7 +4287,11 @@ function Get-CodexBinaryPathsInContainer([string]$Docker, [string]$ContainerId) 
         # stderr wird in eine normale Stringvariable umgeleitet, damit
         # Windows PowerShell 5.1 + ErrorActionPreference=Stop einen
         # harmlosen nativen stderr-Text nicht als Terminierungsfehler behandelt.
-        $tempErr = Join-Path $env:TEMP (
+        $tempErrDir = Join-Path $PSScriptRoot "logs"
+        if (-not (Test-Path -LiteralPath $tempErrDir)) {
+            New-Item -ItemType Directory -Path $tempErrDir -Force | Out-Null
+        }
+        $tempErr = Join-Path $tempErrDir (
             "codex-find-" + [guid]::NewGuid().ToString("N") + ".err"
         )
 
@@ -4233,7 +4328,9 @@ function Get-CodexBinaryPathsInContainer([string]$Docker, [string]$ContainerId) 
             }
         }
         finally {
-            Remove-Item -LiteralPath $tempErr -Force -ErrorAction SilentlyContinue
+            if ($tempErr) {
+                Remove-SetupTempFile $tempErr
+            }
         }
     }
 
@@ -4799,6 +4896,7 @@ if (-not $containerId -and -not $forceDevContainerRebuild) {
     $containerId = Find-DevContainer $docker $InstallDirectory $workspaceVolume $homeVolume $claudeHomeVolume $extensionVolume
 }
 $needsVsCodeBootstrap = $true
+$vsCodeOpenedBySetup = $false
 
 if ($containerId) {
     Write-Host "Vorhandener Dev Container gefunden: $containerId"
@@ -4851,8 +4949,10 @@ if ($needsVsCodeBootstrap) {
 
     Write-Host @"
 
-VS Code wird jetzt geöffnet.
+VS Code wird jetzt automatisch im richtigen Workspace geöffnet.
 Grund: $bootstrapReason
+
+Danach in VS Code:
 
 1. Strg+Shift+P
 
@@ -4877,8 +4977,34 @@ damit Dev Containers den Container nicht durch shutdownAction stoppt.
 
 "@
 
-    & $code -n $InstallDirectory
+    Write-AtcCheckpoint "BEFORE automatischer VS-Code-Workspace-Start"
+    Write-Host "Öffne VS Code automatisch mit Workspace:"
+    Write-Host "  $InstallDirectory" -ForegroundColor Green
+
+    try {
+        & $code --new-window $InstallDirectory
+        if ($LASTEXITCODE -eq 0) {
+            $vsCodeOpenedBySetup = $true
+            Write-AtcCheckpoint "AFTER automatischer VS-Code-Workspace-Start ExitCode=0"
+        }
+        else {
+            Write-Warning "VS-Code-Workspace-Start lieferte Exitcode $LASTEXITCODE."
+            Write-AtcCheckpoint "AFTER automatischer VS-Code-Workspace-Start ExitCode=$LASTEXITCODE"
+            Write-Host "Fallback: VS Code bitte manuell mit diesem Workspace öffnen:" -ForegroundColor Yellow
+            Write-Host "  $InstallDirectory"
+        }
+    }
+    catch {
+        Write-Warning "VS-Code-Workspace konnte nicht automatisch geöffnet werden: $($_.Exception.Message)"
+        Write-AtcCheckpoint "FEHLER automatischer VS-Code-Workspace-Start"
+        Write-Host "Fallback: VS Code bitte manuell mit diesem Workspace öffnen:" -ForegroundColor Yellow
+        Write-Host "  $InstallDirectory"
+    }
+
+    Write-AtcCheckpoint "WAITING Dev-Container-Bootstrap durch Benutzer"
+    Write-Host "In VS Code jetzt 'Dev Containers: Reopen in Container' ausführen."
     Read-Host "Wenn der Dev Container vollständig geöffnet ist, VS Code GEÖFFNET LASSEN und hier ENTER drücken"
+    Write-AtcCheckpoint "AFTER Dev-Container-Bootstrap durch Benutzer"
     Write-Host "VS-Code-/Dev-Container-Aufbau wurde vom Benutzer bestätigt."
     Write-Host "Suche den erzeugten Dev Container..."
 
@@ -5123,7 +5249,16 @@ Write-Host ""
 Write-Host "Das technische Setup ist abgeschlossen." -ForegroundColor Green
 Write-Host ""
 
-$vsCodeDirect = Open-VsCodeInDevContainer $code $InstallDirectory "/workspaces"
+$vsCodeDirect = $false
+if ($vsCodeOpenedBySetup) {
+    Write-AtcCheckpoint "SKIP finaler VS-Code-Start; Workspace wurde bereits automatisch geöffnet"
+    Write-Host "VS Code wurde bereits automatisch mit dem richtigen Workspace geöffnet und bleibt offen." -ForegroundColor Green
+}
+else {
+    Write-AtcCheckpoint "BEFORE automatischer finaler VS-Code-Start"
+    $vsCodeDirect = Open-VsCodeInDevContainer $code $InstallDirectory
+    Write-AtcCheckpoint ("AFTER automatischer finaler VS-Code-Start Erfolg={0}" -f $vsCodeDirect)
+}
 
 Write-Host ""
 Write-Host "In VS Code anschließend:"
@@ -5148,10 +5283,11 @@ Write-Host ""
 Write-Host "Dev-Container, ausgewählte KI-Assistenten, Persistenz und Sandbox-Prüfung"
 Write-Host "wurden ohne Fehler abgeschlossen."
 
-if ($vsCodeDirect) {
-    Write-Host "VS Code wurde direkt für den Dev Container gestartet." -ForegroundColor Green
-} else {
-    Write-Host "VS Code wurde als Fallback mit dem lokalen Workspace geöffnet." -ForegroundColor Yellow
+if ($vsCodeOpenedBySetup -or $vsCodeDirect) {
+    Write-Host "VS Code wurde automatisch mit dem richtigen Workspace geöffnet." -ForegroundColor Green
+}
+else {
+    Write-Host "VS Code konnte nicht automatisch geöffnet werden; siehe Warnungen oben." -ForegroundColor Yellow
 }
 
 if ($script:LogPath) {
